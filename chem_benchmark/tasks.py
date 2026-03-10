@@ -580,12 +580,10 @@ def build_q5_prompt(
     smiles_list = _format_smiles_list(molecules)
 
     return (
-        f"Given the following {len(molecules)} molecules, select exactly {k_molecules} molecules "
-        f"and identify one continuous motif from each selected molecule.\n\n"
+        f"Given the following {len(molecules)} molecules, identify one continuous motif from EACH molecule.\n\n"
         f"TASK:\n"
-        f"1. Select exactly {k_molecules} molecules from the list below\n"
-        f"2. From each selected molecule, extract one continuous motif (substructure)\n"
-        f"3. Ensure the total count of {constraint_description} across ALL selected motifs equals {target_value}\n\n"
+        f"1. From EACH of the {k_molecules} molecules below, extract one continuous motif (substructure)\n"
+        f"2. Ensure the total count of {constraint_description} across ALL motifs equals {target_value}\n\n"
         f"CONSTRAINTS:\n"
         f"- Each motif must be a VALID SMILES string (complete, parseable by RDKit)\n"
         f"- Each motif must be a substructure that actually exists in its parent molecule\n"
@@ -602,14 +600,13 @@ def build_q5_prompt(
         f"- Verify your sum equals {target_value} before submitting\n\n"
         f"MOLECULES:\n{smiles_list}\n\n"
         f"STEP-BY-STEP APPROACH:\n"
-        f"1. First, examine WHICH molecules contain {constraint_description}\n"
-        f"2. Focus on molecules that have the target functional groups\n"
-        f"3. For promising molecules, identify potential motifs (≥{min_motif_atoms} atoms)\n"
-        f"4. Extract the EXACT substructure from the parent - copy it precisely\n"
-        f"5. Ensure SMILES is complete: all rings must be properly closed (e.g., c1ccccc1)\n"
-        f"6. Count {constraint_description} in each motif candidate\n"
-        f"7. Select {k_molecules} motifs whose functional group counts sum to exactly {target_value}\n"
-        f"8. Final check: motif exists in parent AND sum equals {target_value}\n\n"
+        f"1. For EACH molecule, identify potential motifs (≥{min_motif_atoms} atoms)\n"
+        f"2. Count {constraint_description} in each motif candidate\n"
+        f"3. Select one motif from each molecule such that the sum equals {target_value}\n"
+        f"4. Note: Some motifs may have 0 {constraint_description} - this is OK!\n"
+        f"5. Extract the EXACT substructure from the parent - copy it precisely\n"
+        f"6. Ensure SMILES is complete: all rings must be properly closed (e.g., c1ccccc1)\n"
+        f"7. Final check: motif exists in parent AND sum equals {target_value}\n\n"
         f"FUNCTIONAL GROUP EXAMPLES (for reference):\n"
         f"- Ketone: C(=O)C or CC(=O)CC (carbonyl between two carbons)\n"
         f"- Carboxylic acid: C(=O)O or CC(=O)O\n"
@@ -618,21 +615,22 @@ def build_q5_prompt(
         f"- Primary amine: CNH2 or CCN\n"
         f"- Alcohol: CO (hydroxyl on sp3 carbon)\n"
         f"- Aromatic ring: c1ccccc1 (benzene)\n\n"
-        f"OUTPUT FORMAT (indices are 0-indexed):\n"
-        f"<indices>0,2</indices>\n"
+        f"OUTPUT FORMAT (indices are 0-indexed, must include ALL molecules):\n"
+        f"<indices>0,1,2</indices>\n"
         f"<motif_0>CCCCCC</motif_0>\n"
-        f"<motif_2>c1ccccc1</motif_2>\n\n"
+        f"<motif_1>c1ccccc1</motif_1>\n"
+        f"<motif_2>CC(=O)O</motif_2>\n\n"
         f"FORMAT RULES:\n"
-        f"- List selected molecule indices in <indices> tag, comma-separated\n"
+        f"- List ALL molecule indices in <indices> tag (0 through {k_molecules-1}), comma-separated\n"
         f"- For each index, provide complete motif SMILES in <motif_N> tag\n"
         f"- Do NOT use <smiles> tags - use <motif_N> where N is the molecule index\n"
         f"- SMILES must be COMPLETE (e.g., 'c1ccccc1' not 'c1ccc')\n\n"
         f"CRITICAL: To find {target_value} {constraint_description}:\n"
-        f"- First identify which molecules CONTAIN {constraint_description}\n"
-        f"- Extract motifs from those molecules that have the functional groups\n"
-        f"- Adjust motif size to get exactly {target_value} total\n\n"
+        f"- You must provide a motif for EVERY molecule (all {k_molecules} molecules)\n"
+        f"- Some motifs may have 0 {constraint_description} - balance is key!\n"
+        f"- Adjust motif selections so total = {target_value}\n\n"
         f"BEFORE SUBMITTING - VERIFY:\n"
-        f"✓ Selected exactly {k_molecules} molecules\n"
+        f"✓ Provided motif for ALL {k_molecules} molecules (indices 0 through {k_molecules-1})\n"
         f"✓ Each SMILES is complete and valid (all rings closed)\n"
         f"✓ Each motif exists in its parent molecule\n"
         f"✓ Count {constraint_description} in each motif\n"
@@ -654,14 +652,28 @@ def generate_q5_instance(
     max_attempts: int = 100,
 ) -> Optional[BenchmarkInstance]:
     """
-    Q5: Constraint satisfaction - select k molecules and motifs satisfying constraint.
+    Q5: Constraint satisfaction - select motifs from ALL molecules satisfying constraint.
 
-    Uses ChEMBL sampling with backtracking DP to ensure solvability.
-    If target_value is None, it will be automatically determined during solution search.
+    NEW DESIGN:
+    - Selects a motif from EVERY molecule (k_molecules = n_molecules)
+    - Uses DP-based subset sum to find achievable targets
+    - Target defaults to closest achievable sum to k/2
+    - Much faster and guaranteed to find solutions
+
+    Uses ChEMBL sampling with DP solver to ensure solvability.
+    If target_value is None, it will be automatically determined as closest to k/2.
     """
+    import logging
     from .motif_extraction import enumerate_motifs_with_functional_groups
 
+    logger = logging.getLogger(__name__)
+
+    # NEW: k_molecules must equal n_molecules (select motif from every molecule)
+    k_molecules = n_molecules
+
     for attempt in range(max_attempts):
+        logger.info(f"Q5 generation attempt {attempt + 1}/{max_attempts}")
+
         # Sample molecules using similarity-based sampling
         try:
             molecules = bank_index.sample_similar_group(
@@ -671,52 +683,51 @@ def generate_q5_instance(
                 max_similarity=0.90,
             )
         except ValueError:
-            # If sampling fails, try again
+            logger.debug("Molecule sampling failed, retrying")
             continue
 
-        # Enumerate motifs for each molecule
+        # Enumerate motifs for each molecule (with caching)
+        logger.info(f"Enumerating motifs for {n_molecules} molecules...")
         molecules_with_motifs = []
-        for mol_smiles in molecules:
+        failed_molecules = 0
+
+        for i, mol_smiles in enumerate(molecules):
             motifs = enumerate_motifs_with_functional_groups(
                 mol_smiles,
-                min_atoms=min_motif_atoms
+                min_atoms=min_motif_atoms,
+                max_motifs=30,  # Reduced from 100 for better performance
+                use_cache=True,
             )
             if not motifs:
+                logger.debug(f"Molecule {i} has no valid motifs (min_atoms={min_motif_atoms})")
+                failed_molecules += 1
                 break  # This molecule has no valid motifs
             molecules_with_motifs.append((mol_smiles, motifs))
 
         if len(molecules_with_motifs) != n_molecules:
+            logger.debug(f"Failed: {failed_molecules} molecules had no valid motifs")
             continue  # Some molecules didn't have valid motifs
 
-        # If target_value is None, try to find a reasonable target by attempting solutions
-        if target_value is None:
-            # Try different target values (from reasonable range)
-            # Start with small values and work up
-            for trial_target in range(1, 15):
-                solution = _solve_q5_backtracking(
-                    molecules_with_motifs,
-                    constraint_type,
-                    trial_target,
-                    k_molecules,
-                )
-                if solution:
-                    target_value = trial_target
-                    break
-        else:
-            # Try to solve constraint satisfaction with specific target
-            solution = _solve_q5_backtracking(
-                molecules_with_motifs,
-                constraint_type,
-                target_value,
-                k_molecules,
-            )
+        logger.info(f"Motif enumeration complete. Solving constraint satisfaction...")
 
-        if solution and target_value is not None:
+        # Use DP-based solver to find achievable targets and select best one
+        solution = _solve_q5_with_dp(
+            molecules_with_motifs,
+            constraint_type,
+            target_value,
+            k_molecules,
+            rng,
+        )
+
+        if solution:
             # Success! Build the instance
+            actual_target = solution["target_value"]
+            logger.info(f"Solution found! Target={actual_target}, Total={solution['total']}")
+
             prompt = build_q5_prompt(
                 molecules,
                 constraint_type,
-                target_value,
+                actual_target,
                 k_molecules,
                 min_motif_atoms
             )
@@ -733,7 +744,7 @@ def generate_q5_instance(
                 },
                 metadata={
                     "constraint_type": constraint_type,
-                    "target_value": target_value,
+                    "target_value": actual_target,
                     "actual_total": solution["total"],
                     "k_molecules": k_molecules,
                     "min_motif_atoms": min_motif_atoms,
@@ -741,9 +752,138 @@ def generate_q5_instance(
                     "values": solution["values"],  # Keep for debugging
                 },
             )
+        else:
+            logger.debug(f"No solution found on attempt {attempt + 1}")
 
     # Failed to find solvable instance
+    logger.warning(f"Failed to generate Q5 instance after {max_attempts} attempts")
     return None
+
+
+def _solve_q5_with_dp(
+    molecules_with_motifs: List[Tuple[str, List[Dict]]],
+    constraint_type: str,
+    target_value: Optional[int],
+    k_molecules: int,
+    rng,
+) -> Optional[Dict]:
+    """
+    DP-based solver for Q5 constraint satisfaction.
+
+    NEW APPROACH:
+    1. Compute all achievable target sums using DP
+    2. If target_value is None, pick the achievable sum closest to k/2
+    3. Use DP to reconstruct the solution
+
+    Much faster than backtracking (O(n*k*max_sum) vs O(2^n)).
+
+    Returns dict with:
+    - selected_molecule_indices: List[int]
+    - selected_motifs: Dict[str, str] (index -> motif SMILES)
+    - values: List[int]
+    - total: int
+    - target_value: int (the actual target used)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    n = len(molecules_with_motifs)
+
+    # Step 1: Build value matrix - for each molecule, list all possible values from its motifs
+    molecule_values = []  # List[List[Tuple[int, str, Dict]]] - value, motif_smiles, motif_data
+
+    for mol_idx, (mol_smiles, motifs) in enumerate(molecules_with_motifs):
+        motif_values = []
+        for motif_data in motifs:
+            # Extract constraint value
+            if constraint_type == "total_aromatic_rings":
+                value = motif_data.get("num_aromatic_rings", 0)
+            elif constraint_type.startswith("total_"):
+                fg_key = constraint_type[6:]  # Remove "total_"
+                if fg_key.endswith("s"):
+                    fg_key = fg_key[:-1]  # Remove trailing "s"
+                value = motif_data["functional_groups"].get(fg_key, 0)
+            else:
+                value = motif_data["functional_groups"].get(constraint_type, 0)
+
+            if value is None:
+                value = 0
+
+            motif_values.append((value, motif_data["motif_smiles"], motif_data))
+
+        molecule_values.append(motif_values)
+
+    # Step 2: Use DP to find all achievable sums
+    # dp[i][s] = True if we can achieve sum s using first i molecules
+    # We also track which motif was used: parent[i][s] = (motif_idx, prev_sum)
+
+    max_possible_sum = sum(max(vals, key=lambda x: x[0])[0] for vals in molecule_values)
+    max_sum = min(max_possible_sum, 200)  # Cap to avoid memory issues
+
+    # Initialize DP table
+    dp = [{} for _ in range(n + 1)]
+    dp[0][0] = True  # Base case: 0 molecules, sum 0
+
+    parent = [{} for _ in range(n + 1)]  # Track which motif was chosen
+
+    # Fill DP table
+    for i in range(n):
+        for prev_sum in dp[i]:
+            if not dp[i][prev_sum]:
+                continue
+
+            # Try each motif from molecule i
+            for motif_idx, (value, motif_smiles, motif_data) in enumerate(molecule_values[i]):
+                new_sum = prev_sum + value
+                if new_sum <= max_sum:
+                    if new_sum not in dp[i + 1]:
+                        dp[i + 1][new_sum] = True
+                        parent[i + 1][new_sum] = (motif_idx, prev_sum)
+
+    # Step 3: Find achievable sums after using all n molecules
+    achievable_sums = [s for s in dp[n] if dp[n][s]]
+
+    if not achievable_sums:
+        logger.warning("No achievable sums found (DP solver)")
+        return None
+
+    # Step 4: Choose target - closest to k/2 if not specified
+    if target_value is None:
+        ideal_target = k_molecules / 2.0
+        target_value = min(achievable_sums, key=lambda s: abs(s - ideal_target))
+        logger.info(f"Auto-selected target={target_value} (closest to k/2={ideal_target:.1f})")
+        logger.info(f"Achievable sums: {sorted(achievable_sums)}")
+    elif target_value not in achievable_sums:
+        logger.warning(f"Target {target_value} not achievable. Achievable: {sorted(achievable_sums)}")
+        return None
+
+    # Step 5: Reconstruct solution by backtracking through DP table
+    selected_molecule_indices = list(range(n))  # All molecules are selected
+    selected_motifs_dict = {}
+    values = []
+
+    current_sum = target_value
+    for i in range(n, 0, -1):
+        if current_sum not in parent[i]:
+            logger.error(f"DP reconstruction failed at molecule {i-1}, sum {current_sum}")
+            return None
+
+        motif_idx, prev_sum = parent[i][current_sum]
+        mol_idx = i - 1
+
+        value, motif_smiles, motif_data = molecule_values[mol_idx][motif_idx]
+
+        selected_motifs_dict[str(mol_idx)] = motif_smiles
+        values.insert(0, value)
+        current_sum = prev_sum
+
+    return {
+        "selected_molecule_indices": selected_molecule_indices,
+        "selected_motifs": selected_motifs_dict,
+        "values": values,
+        "total": target_value,
+        "target_value": target_value,
+    }
 
 
 def _solve_q5_backtracking(

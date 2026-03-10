@@ -1060,8 +1060,8 @@ def main():
                     help="Environment variable name for API key (default: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY based on provider)")
     ap.add_argument("--base_url", type=str, default=None,
                     help="Base URL for API (default: provider-specific default)")
-    ap.add_argument("--max_tokens", type=int, default=5000)
-    ap.add_argument("--thinking_budget", type=int, default=5000,
+    ap.add_argument("--max_tokens", type=int, default=4096)
+    ap.add_argument("--thinking_budget", type=int, default=4096,
                     help="For Gemini 2.5: soft limit on thinking tokens")
     ap.add_argument("--thinking_level", type=str, choices=["low", "medium", "high"], default=None,
                     help="For Gemini 3.x: control reasoning depth (low/medium/high). Recommended for token control.")
