@@ -24,7 +24,14 @@ if str(parent_dir) not in sys.path:
 try:
     from chem_benchmark.isomer_sources import BUILTIN_ISOMER_UNIVERSES
     from chem_benchmark.molecule_bank import BankIndex, load_bank
-    from chem_benchmark.tasks import generate_q1a_instance, generate_q2_instance, generate_q3_instance
+    from chem_benchmark.tasks import (
+        generate_q1a_instance,
+        generate_q2_instance,
+        generate_q3_instance,
+        generate_q4_instance,
+        generate_q5_instance,
+    )
+    from chem_benchmark.scaffold_operations import SCAFFOLD_PAIRS_Q4_EXPANDED, get_diverse_linker
     
     def build_universe_by_formula(**kwargs):
         """Build universe by formula - reimplemented here to avoid import issues."""
@@ -85,7 +92,21 @@ def validate_unified_format(record, expected_task):
             errors.append("REL-C3 answer must contain 'missing_smiles' field")
         if not isinstance(answer.get("missing_smiles"), list):
             errors.append("REL-C3 missing_smiles must be a list")
-    
+
+    elif expected_task == "REL-C4":
+        if "smiles" not in answer:
+            errors.append("REL-C4 answer must contain 'smiles' field")
+
+    elif expected_task == "REL-C5":
+        if "selected_molecule_indices" not in answer:
+            errors.append("REL-C5 answer must contain 'selected_molecule_indices' field")
+        if not isinstance(answer.get("selected_molecule_indices"), list):
+            errors.append("REL-C5 selected_molecule_indices must be a list")
+        if "selected_motifs" not in answer:
+            errors.append("REL-C5 answer must contain 'selected_motifs' field")
+        if not isinstance(answer.get("selected_motifs"), dict):
+            errors.append("REL-C5 selected_motifs must be a dict")
+
     return errors
 
 
@@ -131,6 +152,8 @@ def test_generate_samples():
         "REL-C1": [],
         "REL-C2": [],
         "REL-C3": [],
+        "REL-C4": [],
+        "REL-C5": [],
     }
     
     # Generate REL-C1 (Q2) samples
@@ -247,7 +270,101 @@ def test_generate_samples():
                 results["REL-C3"].append(unified)
         except Exception as e:
             print(f"  [ERROR] Failed to generate REL-C3 sample {i}: {e}")
-    
+
+    # Generate REL-C4 (Q4) samples
+    print("\n[TEST] Generating 3 REL-C4 (Q4) samples...")
+    for i in range(3):
+        try:
+            # Select random scaffold pair and linker
+            scaffold_pair = rng.choice(SCAFFOLD_PAIRS_Q4_EXPANDED)
+            linker_smiles, linker_category = get_diverse_linker(rng, min_atoms=6, exclude_benzene=True)
+
+            inst = generate_q4_instance(
+                instance_id=f"test_q4_{i:03d}",
+                scaffold_pair=scaffold_pair,
+                linker=linker_smiles,
+                linker_category=linker_category,
+                group_size=2,
+                min_answer_atoms=6,
+                rng=rng,
+                max_attempts=50,
+            )
+
+            # Convert to unified format
+            unified = {
+                "id": inst.id,
+                "domain": "chemistry",
+                "task": "REL-C4",
+                "question": inst.prompt,
+                "answer": {
+                    "smiles": inst.answer["smiles"],
+                    "molecules": inst.molecules if inst.molecules else [],
+                },
+                "metadata": inst.metadata.copy() if inst.metadata else {},
+            }
+            unified["metadata"]["original_task"] = inst.task
+
+            # Validate
+            errors = validate_unified_format(unified, "REL-C4")
+            if errors:
+                print(f"  [ERROR] Sample {i} validation failed:")
+                for error in errors:
+                    print(f"    - {error}")
+            else:
+                print(f"  [OK] Sample {i} validated successfully")
+                results["REL-C4"].append(unified)
+        except Exception as e:
+            print(f"  [ERROR] Failed to generate REL-C4 sample {i}: {e}")
+
+    # Generate REL-C5 (Q5) samples
+    if bank_index is not None:
+        print("\n[TEST] Generating 3 REL-C5 (Q5) samples...")
+        constraint_types = ["total_carboxylic_acids", "total_aromatic_rings", "total_primary_amines"]
+        for i in range(3):
+            try:
+                constraint_type = constraint_types[i % len(constraint_types)]
+
+                inst = generate_q5_instance(
+                    instance_id=f"test_q5_{i:03d}",
+                    bank_index=bank_index,
+                    n_molecules=5,
+                    k_molecules=3,
+                    constraint_type=constraint_type,
+                    target_value=None,  # Will be determined during generation
+                    min_motif_atoms=6,
+                    rng=rng,
+                    max_attempts=100,
+                )
+
+                # Convert to unified format
+                unified = {
+                    "id": inst.id,
+                    "domain": "chemistry",
+                    "task": "REL-C5",
+                    "question": inst.prompt,
+                    "answer": {
+                        "selected_molecule_indices": inst.answer["selected_molecule_indices"],
+                        "selected_motifs": inst.answer["selected_motifs"],
+                        "molecules": inst.molecules,
+                    },
+                    "metadata": inst.metadata.copy() if inst.metadata else {},
+                }
+                unified["metadata"]["original_task"] = inst.task
+
+                # Validate
+                errors = validate_unified_format(unified, "REL-C5")
+                if errors:
+                    print(f"  [ERROR] Sample {i} validation failed:")
+                    for error in errors:
+                        print(f"    - {error}")
+                else:
+                    print(f"  [OK] Sample {i} validated successfully")
+                    results["REL-C5"].append(unified)
+            except Exception as e:
+                print(f"  [ERROR] Failed to generate REL-C5 sample {i}: {e}")
+    else:
+        print("\n[SKIP] Skipping REL-C5 generation (bank too small)")
+
     # Summary
     print("\n" + "=" * 60)
     print("Test Summary")
@@ -265,11 +382,13 @@ def test_generate_samples():
     # Check if all tests passed
     all_passed = all(len(samples) == 3 for samples in results.values() if results.get("REL-C2") or len(results["REL-C2"]) == 0)
     if not all_passed:
-        # Allow REL-C2 to be skipped if bank is not available
+        # Allow REL-C2 and REL-C5 to be skipped if bank is not available
         c1_ok = len(results["REL-C1"]) == 3
         c2_ok = len(results["REL-C2"]) == 3 or bank_index is None
         c3_ok = len(results["REL-C3"]) == 3
-        all_passed = c1_ok and c2_ok and c3_ok
+        c4_ok = len(results["REL-C4"]) == 3
+        c5_ok = len(results["REL-C5"]) == 3 or bank_index is None
+        all_passed = c1_ok and c2_ok and c3_ok and c4_ok and c5_ok
     
     if all_passed:
         print("\n[SUCCESS] All tests passed!")

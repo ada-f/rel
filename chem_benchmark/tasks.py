@@ -371,3 +371,496 @@ def generate_q3_instance(
         answer={"missing_smiles": missing},
         metadata={"formula": f, "universe_size": len(universe), "given_size": len(given)},
     )
+
+
+def build_q4_prompt(
+    group_combined: List[str],
+    scaffold_smiles: List[str],
+) -> str:
+    """
+    Build prompt for Q4 - identify linker fragment that connects scaffolds.
+
+
+    Args:
+        group_combined: List of molecules containing all scaffolds connected by linker
+        scaffold_smiles: List of scaffold SMILES to exclude from answer
+
+    Returns:
+        Formatted prompt string for Q4 task
+    """
+    combined_list = _format_smiles_list(group_combined)
+    scaffold_list = _format_smiles_list(scaffold_smiles)
+    n_scaffolds = len(scaffold_smiles)
+
+    return (
+        f"CHEMISTRY PROBLEM: Identify the Linker Fragment\n\n"
+        f"CONCEPT:\n"
+        f"The molecules below are built from {n_scaffolds} different scaffolds connected by a common linker.\n"
+        f"Your task is to identify this linker - the fragment that:\n"
+        f"  • Connects the scaffolds together\n"
+        f"  • Is present in every molecule\n"
+        f"  • Does NOT include any scaffold itself\n\n"
+        f"INPUT MOLECULES:\n"
+        f"{combined_list}\n\n"
+        f"SCAFFOLDS (to exclude from your answer):\n"
+        f"{scaffold_list}\n\n"
+        f"WHAT YOU NEED TO FIND:\n"
+        f"The LARGEST connected fragment that:\n"
+        f"  1. Is a substructure of every molecule above\n"
+        f"  2. Does NOT overlap with any of the {n_scaffolds} scaffolds\n"
+        f"  3. Is the connecting piece between scaffolds\n\n"
+        f"VALIDATION CHECKLIST:\n"
+        f"Before submitting your answer, verify:\n"
+        f"□ Is it present in molecule 1? molecule 2? ... all molecules?\n"
+        f"□ Does it match or contain scaffold 1? scaffold 2? ... any scaffold? (should be NO)\n"
+        f"□ Is the SMILES complete and valid? (all rings properly closed)\n"
+        f"□ Is it reasonably sized? (typically 5-15 atoms for a linker)\n\n"
+        f"EXAMPLES OF LINKERS:\n"
+        f"  • Alkyl chains: CCCC, CCCCC, CC(C)CC\n"
+        f"  • Cyclic ethers: C1CCOCC1 (tetrahydropyran)\n"
+        f"  • Ether chains: CCOC(C)OCC\n"
+        f"  • Functional linkers: CCCC(O)CCC (with hydroxyl)\n\n"
+        f"OUTPUT FORMAT:\n"
+        f"<smiles>YOUR_ANSWER_HERE</smiles>\n"
+        f"No explanation."
+    )
+
+
+def generate_q4_instance(
+    *,
+    instance_id: str,
+    scaffolds: List[Dict[str, str]],
+    linker: str,
+    linker_category: str,
+    molecules_per_group: int,
+    min_answer_atoms: int,
+    rng,
+    max_attempts: int = 50,
+) -> Optional[BenchmarkInstance]:
+    """
+    Q4: Scaffold avoidance - generalized for N scaffolds.
+
+    Creates N+1 groups:
+    - Group i (i=1..N): scaffold_i + linker + decoration
+    - Group N+1: scaffold_1 + linker + scaffold_2 + ... + scaffold_N + decoration
+
+    Args:
+        scaffolds: List of dicts with keys "scaffold" (SMILES) and "name" (str)
+        molecules_per_group: Number of molecules per group
+    """
+    from .scaffold_operations import remove_substructure_get_largest_fragment
+
+    N = len(scaffolds)
+    if N < 2:
+        raise ValueError("Need at least 2 scaffolds for Q4")
+
+    # Extract scaffold SMILES and names
+    scaffold_smiles = [s["scaffold"] for s in scaffolds]
+    scaffold_names = [s["name"] for s in scaffolds]
+
+    # Decorations for variety
+    decorations = ["C", "CC", "CCC", "C(C)C", "CCCC", "C(C)CC"]
+
+    # Generate individual groups (Groups 1 to N)
+    groups = [[] for _ in range(N)]
+    max_mol_attempts = 20
+
+    for group_idx in range(N):
+        attempts = 0
+        while len(groups[group_idx]) < molecules_per_group and attempts < max_mol_attempts:
+            dec = rng.choice(decorations)
+            mol_smiles = f"{scaffold_smiles[group_idx]}{linker}{dec}"
+            mol = mol_from_smiles(mol_smiles)
+            if mol:
+                can_smi = canonical_smiles(mol)
+                if can_smi not in groups[group_idx]:  # Avoid duplicates
+                    groups[group_idx].append(can_smi)
+            attempts += 1
+
+        # Check if generation succeeded
+        if len(groups[group_idx]) < molecules_per_group:
+            return None
+
+    # Generate combined group (Group N+1) with all scaffolds chained
+    group_combined = []
+    attempts = 0
+    while len(group_combined) < molecules_per_group and attempts < max_mol_attempts:
+        dec = rng.choice(decorations)
+        # Chain all scaffolds with linker between each
+        mol_smiles = linker.join(scaffold_smiles) + dec
+        mol = mol_from_smiles(mol_smiles)
+        if mol:
+            can_smi = canonical_smiles(mol)
+            if can_smi not in group_combined:
+                group_combined.append(can_smi)
+        attempts += 1
+
+    # Verify combined group has correct size
+    if len(group_combined) < molecules_per_group:
+        return None
+
+    # Compute expected answer by removing all scaffolds from combined group
+    filtered_fragments = []
+    for mol_smiles in group_combined:
+        frag = remove_substructure_get_largest_fragment(
+            mol_smiles,
+            scaffold_smiles  # List of all scaffolds
+        )
+        if frag:
+            filtered_fragments.append(frag)
+
+    if len(filtered_fragments) != len(group_combined):
+        return None  # Some molecules didn't produce valid fragments
+
+    # Find MCS of filtered fragments
+    mcs_result = solve_q1_largest_common_motif(filtered_fragments)
+    if mcs_result is None:
+        return None
+
+    # Check if MCS meets minimum size
+    if mcs_result.num_atoms < min_answer_atoms:
+        return None
+
+    # Build the instance
+    # Use simplified prompt (achieves 80% accuracy vs 0% with old complex prompt)
+    prompt = build_q4_prompt(group_combined, scaffold_smiles)
+
+    all_molecules = [mol for group in groups for mol in group] + group_combined
+
+    # Build metadata with dynamic group storage
+    metadata = {
+        "n_groups": N,
+        "molecules_per_group": molecules_per_group,
+        "scaffolds": scaffold_smiles,
+        "scaffold_names": scaffold_names,
+        "linker_template": linker,
+        "answer_num_atoms": mcs_result.num_atoms,
+        "answer_num_bonds": mcs_result.num_bonds,
+        "linker_category": linker_category,
+        "group_combined": group_combined,
+    }
+
+    # Store individual groups dynamically
+    for i in range(N):
+        metadata[f"group_{i+1}"] = groups[i]
+
+    return BenchmarkInstance(
+        id=instance_id,
+        task="q4_avoid_scaffolds",
+        n_molecules=len(all_molecules),
+        molecules=all_molecules,
+        prompt=prompt,
+        answer={"smiles": mcs_result.motif_smiles},
+        metadata=metadata,
+    )
+
+
+def build_q5_prompt(
+    molecules: List[str],
+    constraint_type: str,
+    target_value: int,
+    k_molecules: int,
+    min_motif_atoms: int,
+) -> str:
+    """Build prompt for Q5 (constraint satisfaction with selection)."""
+    constraint_name_map = {
+        "aromatic_ring": "aromatic rings (e.g., benzene c1ccccc1, pyridine)",
+        "carboxylic_acid": "carboxylic acid groups (-COOH, written as C(=O)O in SMILES)",
+        "alcohol": "alcohol groups (-OH attached to sp3 carbon)",
+        "primary_amine": "primary amine groups (-NH2 attached to carbon)",
+        "ketone": "ketone groups (C=O bonded to two carbons, NOT in acids/esters/amides)",
+        "ether": "ether linkages (C-O-C where O connects two carbons)",
+        "fluoride": "fluorine atoms (F)",
+        "chloride": "chlorine atoms (Cl)",
+        "double_bond": "carbon-carbon double bonds (C=C)",
+        "nitrile": "nitrile groups (-C≡N)",
+    }
+
+    constraint_description = constraint_name_map.get(constraint_type, constraint_type)
+    smiles_list = _format_smiles_list(molecules)
+
+    return (
+        f"Given the following {len(molecules)} molecules, select exactly {k_molecules} molecules "
+        f"and identify one continuous motif from each selected molecule.\n\n"
+        f"TASK:\n"
+        f"1. Select exactly {k_molecules} molecules from the list below\n"
+        f"2. From each selected molecule, extract one continuous motif (substructure)\n"
+        f"3. Ensure the total count of {constraint_description} across ALL selected motifs equals {target_value}\n\n"
+        f"CONSTRAINTS:\n"
+        f"- Each motif must be a VALID SMILES string (complete, parseable by RDKit)\n"
+        f"- Each motif must be a substructure that actually exists in its parent molecule\n"
+        f"- Each motif must contain at least {min_motif_atoms} heavy atoms (non-hydrogen)\n"
+        f"- The sum of {constraint_description} across all selected motifs = {target_value}\n\n"
+        f"CRITICAL VALIDATION RULES:\n"
+        f"- SMILES must be COMPLETE - do NOT truncate or abbreviate\n"
+        f"- RINGS MUST BE CLOSED: Every ring opening digit (1-9) must have a matching closing digit\n"
+        f"  WRONG: 'CC12CCC(=O)C=C1' (ring 2 never closes) - INVALID SMILES\n"
+        f"  RIGHT: 'CC12CCC(=O)C=C1CC2' (both rings 1 and 2 close properly)\n"
+        f"- Each motif MUST be a continuous fragment that exists exactly as written in its parent molecule\n"
+        f"- When extracting from complex fused rings, use simpler motifs if needed\n"
+        f"- Count {constraint_description} carefully - be specific about what counts\n"
+        f"- Verify your sum equals {target_value} before submitting\n\n"
+        f"MOLECULES:\n{smiles_list}\n\n"
+        f"STEP-BY-STEP APPROACH:\n"
+        f"1. First, examine WHICH molecules contain {constraint_description}\n"
+        f"2. Focus on molecules that have the target functional groups\n"
+        f"3. For promising molecules, identify potential motifs (≥{min_motif_atoms} atoms)\n"
+        f"4. Extract the EXACT substructure from the parent - copy it precisely\n"
+        f"5. Ensure SMILES is complete: all rings must be properly closed (e.g., c1ccccc1)\n"
+        f"6. Count {constraint_description} in each motif candidate\n"
+        f"7. Select {k_molecules} motifs whose functional group counts sum to exactly {target_value}\n"
+        f"8. Final check: motif exists in parent AND sum equals {target_value}\n\n"
+        f"FUNCTIONAL GROUP EXAMPLES (for reference):\n"
+        f"- Ketone: C(=O)C or CC(=O)CC (carbonyl between two carbons)\n"
+        f"- Carboxylic acid: C(=O)O or CC(=O)O\n"
+        f"- Ester: C(=O)OC or CC(=O)OC\n"
+        f"- Aldehyde: C(=O) at chain end\n"
+        f"- Primary amine: CNH2 or CCN\n"
+        f"- Alcohol: CO (hydroxyl on sp3 carbon)\n"
+        f"- Aromatic ring: c1ccccc1 (benzene)\n\n"
+        f"OUTPUT FORMAT (indices are 0-indexed):\n"
+        f"<indices>0,2</indices>\n"
+        f"<motif_0>CCCCCC</motif_0>\n"
+        f"<motif_2>c1ccccc1</motif_2>\n\n"
+        f"FORMAT RULES:\n"
+        f"- List selected molecule indices in <indices> tag, comma-separated\n"
+        f"- For each index, provide complete motif SMILES in <motif_N> tag\n"
+        f"- Do NOT use <smiles> tags - use <motif_N> where N is the molecule index\n"
+        f"- SMILES must be COMPLETE (e.g., 'c1ccccc1' not 'c1ccc')\n\n"
+        f"CRITICAL: To find {target_value} {constraint_description}:\n"
+        f"- First identify which molecules CONTAIN {constraint_description}\n"
+        f"- Extract motifs from those molecules that have the functional groups\n"
+        f"- Adjust motif size to get exactly {target_value} total\n\n"
+        f"BEFORE SUBMITTING - VERIFY:\n"
+        f"✓ Selected exactly {k_molecules} molecules\n"
+        f"✓ Each SMILES is complete and valid (all rings closed)\n"
+        f"✓ Each motif exists in its parent molecule\n"
+        f"✓ Count {constraint_description} in each motif\n"
+        f"✓ Sum of {constraint_description} = {target_value} (NOT more, NOT less)\n\n"
+        f"Provide ONLY the formatted answer above. No explanation."
+    )
+
+
+def generate_q5_instance(
+    *,
+    instance_id: str,
+    bank_index: BankIndex,
+    n_molecules: int,
+    k_molecules: int,
+    constraint_type: str,
+    target_value: Optional[int],
+    min_motif_atoms: int,
+    rng,
+    max_attempts: int = 100,
+) -> Optional[BenchmarkInstance]:
+    """
+    Q5: Constraint satisfaction - select k molecules and motifs satisfying constraint.
+
+    Uses ChEMBL sampling with backtracking DP to ensure solvability.
+    If target_value is None, it will be automatically determined during solution search.
+    """
+    from .motif_extraction import enumerate_motifs_with_functional_groups
+
+    for attempt in range(max_attempts):
+        # Sample molecules using similarity-based sampling
+        try:
+            molecules = bank_index.sample_similar_group(
+                n_molecules,
+                rng=rng,
+                min_similarity=0.35,
+                max_similarity=0.90,
+            )
+        except ValueError:
+            # If sampling fails, try again
+            continue
+
+        # Enumerate motifs for each molecule
+        molecules_with_motifs = []
+        for mol_smiles in molecules:
+            motifs = enumerate_motifs_with_functional_groups(
+                mol_smiles,
+                min_atoms=min_motif_atoms
+            )
+            if not motifs:
+                break  # This molecule has no valid motifs
+            molecules_with_motifs.append((mol_smiles, motifs))
+
+        if len(molecules_with_motifs) != n_molecules:
+            continue  # Some molecules didn't have valid motifs
+
+        # If target_value is None, try to find a reasonable target by attempting solutions
+        if target_value is None:
+            # Try different target values (from reasonable range)
+            # Start with small values and work up
+            for trial_target in range(1, 15):
+                solution = _solve_q5_backtracking(
+                    molecules_with_motifs,
+                    constraint_type,
+                    trial_target,
+                    k_molecules,
+                )
+                if solution:
+                    target_value = trial_target
+                    break
+        else:
+            # Try to solve constraint satisfaction with specific target
+            solution = _solve_q5_backtracking(
+                molecules_with_motifs,
+                constraint_type,
+                target_value,
+                k_molecules,
+            )
+
+        if solution and target_value is not None:
+            # Success! Build the instance
+            prompt = build_q5_prompt(
+                molecules,
+                constraint_type,
+                target_value,
+                k_molecules,
+                min_motif_atoms
+            )
+
+            return BenchmarkInstance(
+                id=instance_id,
+                task="q5_constraint_satisfaction_selection",
+                n_molecules=n_molecules,
+                molecules=list(molecules),
+                prompt=prompt,
+                answer={
+                    "selected_molecule_indices": solution["selected_molecule_indices"],
+                    "selected_motifs": solution["selected_motifs"],
+                },
+                metadata={
+                    "constraint_type": constraint_type,
+                    "target_value": target_value,
+                    "actual_total": solution["total"],
+                    "k_molecules": k_molecules,
+                    "min_motif_atoms": min_motif_atoms,
+                    "attempt": attempt,
+                    "values": solution["values"],  # Keep for debugging
+                },
+            )
+
+    # Failed to find solvable instance
+    return None
+
+
+def _solve_q5_backtracking(
+    molecules_with_motifs: List[Tuple[str, List[Dict]]],
+    constraint_type: str,
+    target_value: int,
+    k_molecules: int,
+) -> Optional[Dict]:
+    """
+    Backtracking solver for Q5 constraint satisfaction.
+
+    Returns dict with:
+    - selected_molecule_indices: List[int]
+    - selected_motifs: Dict[str, str] (index -> motif SMILES)
+    - values: List[int]
+    - total: int
+    """
+    n = len(molecules_with_motifs)
+
+    def backtrack(
+        mol_idx: int,
+        selected_count: int,
+        current_sum: int,
+        selected_indices: List[int],
+        selected_motifs_dict: Dict[str, str],
+        values: List[int],
+    ):
+        # Base case: processed all molecules
+        if mol_idx == n:
+            if selected_count == k_molecules and current_sum == target_value:
+                return {
+                    "selected_molecule_indices": selected_indices[:],
+                    "selected_motifs": selected_motifs_dict.copy(),
+                    "values": values[:],
+                    "total": current_sum,
+                }
+            return None
+
+        remaining_molecules = n - mol_idx
+
+        # Pruning: impossible to reach k molecules
+        if selected_count + remaining_molecules < k_molecules:
+            return None
+
+        # Pruning: already selected k molecules, skip remaining
+        if selected_count == k_molecules:
+            return backtrack(
+                mol_idx + 1,
+                selected_count,
+                current_sum,
+                selected_indices,
+                selected_motifs_dict,
+                values,
+            )
+
+        mol_smiles, motifs = molecules_with_motifs[mol_idx]
+
+        # Option 1: Skip this molecule
+        result = backtrack(
+            mol_idx + 1,
+            selected_count,
+            current_sum,
+            selected_indices,
+            selected_motifs_dict,
+            values,
+        )
+        if result:
+            return result
+
+        # Option 2: Select a motif from this molecule
+        for motif_data in motifs:
+            # Get constraint value
+            # Map constraint_type to the actual key in functional_groups or num_aromatic_rings
+            if constraint_type == "total_aromatic_rings":
+                value = motif_data.get("num_aromatic_rings", 0)
+            elif constraint_type.startswith("total_"):
+                # Remove "total_" prefix and handle singular/plural
+                fg_key = constraint_type[6:]  # Remove "total_"
+                # Convert plural to singular for functional_groups dict
+                if fg_key.endswith("s"):
+                    fg_key = fg_key[:-1]  # Remove trailing "s"
+                value = motif_data["functional_groups"].get(fg_key, 0)
+            else:
+                # Fallback: use constraint_type directly
+                value = motif_data["functional_groups"].get(constraint_type, 0)
+
+            # Ensure value is not None
+            if value is None:
+                value = 0
+
+            # Pruning: check if we can still reach target
+            needed = k_molecules - selected_count - 1
+            if current_sum + value > target_value + needed * 20:
+                continue  # Too high
+
+            # Recurse
+            selected_indices.append(mol_idx)
+            selected_motifs_dict[str(mol_idx)] = motif_data["motif_smiles"]
+            values.append(value)
+
+            result = backtrack(
+                mol_idx + 1,
+                selected_count + 1,
+                current_sum + value,
+                selected_indices,
+                selected_motifs_dict,
+                values,
+            )
+
+            if result:
+                return result
+
+            # Backtrack
+            selected_indices.pop()
+            del selected_motifs_dict[str(mol_idx)]
+            values.pop()
+
+        return None
+
+    return backtrack(0, 0, 0, [], {}, [])

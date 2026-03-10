@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from rdkit import Chem
 from rdkit.Chem import rdFMCS
 
-from .llm_runner import extract_all_smiles_tags, extract_first_smiles_tag, extract_yesno_tag
+from .llm_runner import extract_all_smiles_tags, extract_first_smiles_tag, extract_yesno_tag, extract_indices_and_motifs
 from .rdkit_utils import are_isomorphic_smiles, canonical_smiles_from_smiles, mol_from_smiles
 
 
@@ -247,23 +247,258 @@ def evaluate_c3_response(question: str, answer: Dict[str, Any], response: str) -
     }
 
 
+def evaluate_c4_response(question: str, answer: Dict[str, Any], response: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Evaluate response for REL-C4 (avoid certain scaffolds).
+
+    Similar to REL-C2, uses isomorphic matching to verify the response SMILES
+    represents the same molecule as the correct answer.
+
+    Enhanced with edge case detection:
+    - Validates SMILES parseability
+    - Checks scaffold contamination (if metadata provided)
+    - Verifies linker is substructure of combined molecules
+    - Checks size reasonableness
+
+    Args:
+        question: The question text
+        answer: Answer dict containing "smiles" (correct SMILES string)
+        response: Model response text
+        metadata: Optional metadata dict containing:
+            - "scaffolds": list of scaffold SMILES to check contamination
+            - "group_combined": list of molecule SMILES to verify substructure presence
+
+    Returns:
+        Dictionary with evaluation results:
+        - correct: bool (True if SMILES represent the same molecule)
+        - pred: str or None (extracted SMILES from response)
+        - gold: str (correct SMILES)
+        - response_is_substructure_of_correct: bool
+        - correct_is_substructure_of_response: bool
+        - overlap_metric: float
+        - pred_valid_smiles: bool (is prediction parseable)
+        - pred_num_atoms: int or None (size of predicted molecule)
+        - gold_num_atoms: int (size of gold molecule)
+        - pred_contains_scaffold: bool or None (does prediction contain scaffold)
+        - pred_in_all_combined_molecules: bool or None (is prediction in all combined molecules)
+        - edge_case_warnings: list[str] (warnings about edge cases)
+    """
+    pred_smiles = extract_first_smiles_tag(response)
+    gold_smiles = answer.get("smiles")
+
+    if gold_smiles is None:
+        return {
+            "correct": False,
+            "pred": pred_smiles,
+            "gold": None,
+            "response_is_substructure_of_correct": False,
+            "correct_is_substructure_of_response": False,
+            "overlap_metric": 0.0,
+            "pred_valid_smiles": False,
+            "pred_num_atoms": None,
+            "gold_num_atoms": None,
+            "pred_contains_scaffold": None,
+            "pred_in_all_combined_molecules": None,
+            "edge_case_warnings": ["Missing smiles in answer"],
+            "error": "Missing smiles in answer",
+        }
+
+    if pred_smiles is None:
+        return {
+            "correct": False,
+            "pred": None,
+            "gold": gold_smiles,
+            "response_is_substructure_of_correct": False,
+            "correct_is_substructure_of_response": False,
+            "overlap_metric": 0.0,
+            "pred_valid_smiles": False,
+            "pred_num_atoms": None,
+            "gold_num_atoms": mol_from_smiles(gold_smiles).GetNumHeavyAtoms() if mol_from_smiles(gold_smiles) else None,
+            "pred_contains_scaffold": None,
+            "pred_in_all_combined_molecules": None,
+            "edge_case_warnings": ["No SMILES extracted from response"],
+        }
+
+    # Edge case tracking
+    warnings = []
+
+    # Validate prediction is parseable SMILES
+    pred_mol = mol_from_smiles(pred_smiles)
+    pred_valid = pred_mol is not None
+    if not pred_valid:
+        warnings.append("Predicted SMILES is not parseable")
+
+    pred_num_atoms = pred_mol.GetNumHeavyAtoms() if pred_mol else None
+
+    # Validate gold SMILES
+    gold_mol = mol_from_smiles(gold_smiles)
+    gold_num_atoms = gold_mol.GetNumHeavyAtoms() if gold_mol else None
+
+    # Check size reasonableness (predicted linker should be similar size to gold)
+    if pred_num_atoms and gold_num_atoms:
+        size_ratio = pred_num_atoms / gold_num_atoms
+        if size_ratio < 0.3:
+            warnings.append(f"Predicted linker is much smaller than expected ({pred_num_atoms} vs {gold_num_atoms} atoms)")
+        elif size_ratio > 3.0:
+            warnings.append(f"Predicted linker is much larger than expected ({pred_num_atoms} vs {gold_num_atoms} atoms)")
+
+    # Check scaffold contamination if metadata provided
+    pred_contains_scaffold = None
+    if metadata and "scaffolds" in metadata and pred_mol:
+        scaffold_list = metadata["scaffolds"]
+        for scaffold_smiles in scaffold_list:
+            if is_substructure(scaffold_smiles, pred_smiles):
+                pred_contains_scaffold = True
+                warnings.append(f"Predicted SMILES contains scaffold: {scaffold_smiles}")
+                break
+        if pred_contains_scaffold is None:
+            pred_contains_scaffold = False
+
+    # Check if prediction is present in all combined molecules
+    pred_in_all_combined = None
+    if metadata and "group_combined" in metadata and pred_mol:
+        combined_molecules = metadata["group_combined"]
+        pred_in_all_combined = all(
+            is_substructure(pred_smiles, mol_smiles)
+            for mol_smiles in combined_molecules
+        )
+        if not pred_in_all_combined:
+            warnings.append("Predicted SMILES is not a substructure of all combined molecules")
+
+    # Check if SMILES represent the same molecule (isomorphic matching)
+    correct = are_isomorphic_smiles(pred_smiles, gold_smiles)
+
+    # Also compute substructure relationships for informational purposes
+    response_is_sub = is_substructure(pred_smiles, gold_smiles)
+    correct_is_sub = is_substructure(gold_smiles, pred_smiles)
+
+    # Calculate overlap metric
+    overlap = calculate_overlap_metric(pred_smiles, gold_smiles)
+
+    # Add overlap-based warning
+    if overlap < 0.5 and not correct:
+        warnings.append(f"Low overlap with correct answer (overlap={overlap:.2f})")
+
+    return {
+        "correct": correct,
+        "pred": pred_smiles,
+        "gold": gold_smiles,
+        "response_is_substructure_of_correct": response_is_sub,
+        "correct_is_substructure_of_response": correct_is_sub,
+        "overlap_metric": overlap,
+        "pred_valid_smiles": pred_valid,
+        "pred_num_atoms": pred_num_atoms,
+        "gold_num_atoms": gold_num_atoms,
+        "pred_contains_scaffold": pred_contains_scaffold,
+        "pred_in_all_combined_molecules": pred_in_all_combined,
+        "edge_case_warnings": warnings,
+    }
+
+
+def evaluate_c5_response(question: str, answer: Dict[str, Any], response: str) -> Dict[str, Any]:
+    """
+    Evaluate response for REL-C5 (constraint satisfaction with motif selection).
+
+    Checks if the model selected the correct set of molecule indices and corresponding
+    motifs that satisfy the constraint.
+
+    Args:
+        question: The question text
+        answer: Answer dict containing:
+            - "selected_molecule_indices": list[int]
+            - "selected_motifs": dict[str, str] (molecule_idx -> motif_smiles)
+            - "molecules": list[str] (input molecules)
+        response: Model response text
+
+    Returns:
+        Dictionary with evaluation results:
+        - correct: bool (True if both indices and motifs match exactly)
+        - indices_correct: bool (True if indices match)
+        - motifs_correct: bool (True if all motifs match)
+        - pred_indices: list[int] or None
+        - gold_indices: list[int]
+        - pred_motifs: dict[str, str] or None
+        - gold_motifs: dict[str, str]
+    """
+    # Extract predicted indices and motifs from response
+    pred_indices, pred_motifs = extract_indices_and_motifs(response)
+
+    # Get gold answers
+    gold_indices = answer.get("selected_molecule_indices", [])
+    gold_motifs = answer.get("selected_motifs", {})
+
+    if not isinstance(gold_indices, list):
+        return {
+            "correct": False,
+            "indices_correct": False,
+            "motifs_correct": False,
+            "pred_indices": pred_indices,
+            "gold_indices": [],
+            "pred_motifs": pred_motifs,
+            "gold_motifs": {},
+            "error": "Missing or invalid selected_molecule_indices in answer",
+        }
+
+    # Check if indices match (order-independent)
+    indices_correct = (
+        pred_indices is not None and
+        set(pred_indices) == set(gold_indices)
+    )
+
+    # Check if motifs match (use isomorphic matching for SMILES)
+    motifs_correct = False
+    if pred_motifs is not None and indices_correct:
+        # Check that all predicted indices have motifs
+        if set(pred_motifs.keys()) == set(str(i) for i in gold_indices):
+            # Check each motif using isomorphic matching
+            all_match = True
+            for idx_str in gold_motifs.keys():
+                gold_motif_smiles = gold_motifs[idx_str]
+                pred_motif_smiles = pred_motifs.get(idx_str)
+
+                if pred_motif_smiles is None:
+                    all_match = False
+                    break
+
+                if not are_isomorphic_smiles(pred_motif_smiles, gold_motif_smiles):
+                    all_match = False
+                    break
+
+            motifs_correct = all_match
+
+    # Overall correct if both indices and motifs are correct
+    correct = indices_correct and motifs_correct
+
+    return {
+        "correct": correct,
+        "indices_correct": indices_correct,
+        "motifs_correct": motifs_correct,
+        "pred_indices": pred_indices,
+        "gold_indices": gold_indices,
+        "pred_motifs": pred_motifs,
+        "gold_motifs": gold_motifs,
+    }
+
+
 def evaluate_response(question: str, answer: Dict[str, Any], response: str, task: Optional[str] = None) -> Dict[str, Any]:
     """
     Evaluate a model response for a chemistry benchmark question.
-    
+
     Routes to task-specific evaluators based on task type. Task can be inferred
     from answer structure if not provided.
-    
+
     Args:
         question: The question text
         answer: Answer dict containing task-specific fields:
             - REL-C1: "label" ("Yes" or "No")
             - REL-C2: "smiles" (SMILES string)
             - REL-C3: "missing_smiles" (list of SMILES strings)
+            - REL-C4: "smiles" (SMILES string)
+            - REL-C5: "selected_molecule_indices" (list[int]), "selected_motifs" (dict)
         response: Model response text
-        task: Optional task identifier (REL-C1, REL-C2, REL-C3, or legacy names)
+        task: Optional task identifier (REL-C1, REL-C2, REL-C3, REL-C4, REL-C5, or legacy names)
                If not provided, inferred from answer structure
-        
+
     Returns:
         Dictionary with evaluation results (structure depends on task)
     """
@@ -271,13 +506,17 @@ def evaluate_response(question: str, answer: Dict[str, Any], response: str, task
     if task is None:
         if "label" in answer:
             task = "REL-C1"
-        elif "smiles" in answer:
-            task = "REL-C2"
         elif "missing_smiles" in answer:
             task = "REL-C3"
+        elif "selected_molecule_indices" in answer:
+            task = "REL-C5"
+        elif "smiles" in answer:
+            # Need to distinguish between REL-C2 and REL-C4
+            # Check metadata for task type if available
+            task = "REL-C2"  # Default to C2
         else:
             return {"error": "Could not infer task from answer structure", "correct": False}
-    
+
     # Normalize task name (handle legacy names)
     task_upper = task.upper()
     if task_upper == "REL-C1":
@@ -286,5 +525,9 @@ def evaluate_response(question: str, answer: Dict[str, Any], response: str, task
         return evaluate_c2_response(question, answer, response)
     elif task_upper == "REL-C3":
         return evaluate_c3_response(question, answer, response)
+    elif task_upper == "REL-C4":
+        return evaluate_c4_response(question, answer, response)
+    elif task_upper == "REL-C5":
+        return evaluate_c5_response(question, answer, response)
     else:
         return {"error": f"Unknown task: {task}", "correct": False}

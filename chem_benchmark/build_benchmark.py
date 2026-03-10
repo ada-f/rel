@@ -15,7 +15,14 @@ from .molecule_bank import (
     select_diverse_subset_maxmin,
 )
 from .isomer_sources import BUILTIN_ISOMER_UNIVERSES, get_isomer_universe
-from .tasks import generate_q1a_instance, generate_q1b_instance, generate_q2_instance, generate_q3_instance
+from .tasks import (
+    generate_q1a_instance,
+    generate_q1b_instance,
+    generate_q2_instance,
+    generate_q3_instance,
+    generate_q4_instance,
+    generate_q5_instance,
+)
 
 
 def build_universe_by_formula(
@@ -66,6 +73,15 @@ def main():
     ap.add_argument("--q1b_per_n", type=int, default=30, help="Q1b: scaffold-based ChEMBL sampling")
     ap.add_argument("--q2_per_n", type=int, default=30)
     ap.add_argument("--q3_per_n", type=int, default=10)
+
+    ap.add_argument("--num_groups", type=int, nargs="+", default=[2, 3, 4, 5, 6], help="Q4: Number of groups (2-6)")
+    ap.add_argument("--molecules_per_group", type=int, default=2, help="Q4: Number of molecules per group")
+    ap.add_argument("--q4_per_num_groups", type=int, default=200, help="Q4: Instances per num_groups value")
+    ap.add_argument("--generate_q4", action="store_true", help="Generate Q4 instances")
+
+    ap.add_argument("--n_values_q5", type=int, nargs="+", default=[5, 10, 15, 20, 25, 30, 35, 40, 45, 50], help="Q5: Number of molecules")
+    ap.add_argument("--q5_per_n", type=int, default=100, help="Q5: Instances per n_molecules")
+    ap.add_argument("--generate_q5", action="store_true", help="Generate Q5 instances")
 
     ap.add_argument("--use_pubchem", action="store_true")
     ap.add_argument(
@@ -135,12 +151,18 @@ def main():
     q2_created = 0
     q3_attempted = 0
     q3_created = 0
+    q4_attempted = 0
+    q4_created = 0
+    q5_attempted = 0
+    q5_created = 0
 
     # Track unique molecule combinations to avoid duplicates
     seen_q1a_combos = set()
     seen_q1b_combos = set()
     seen_q2_combos = set()
     seen_q3_combos = set()
+    seen_q4_combos = set()
+    seen_q5_combos = set()
 
     # Q1a/Q1b/Q2/Q3 generation stratified by n_values
     for n in args.n_values:
@@ -287,13 +309,156 @@ def main():
                         print(f"[WARN] Failed to generate Q3 instance q3_given{n}_{counter:05d}: {e}")
                     # Otherwise try again
 
+    # Q4 generation (scaffold avoidance)
+    if args.generate_q4:
+        from .scaffold_operations import SCAFFOLD_PAIRS_Q4_EXPANDED, get_diverse_linker
+
+        print(f"[INFO] Starting Q4 generation with {len(SCAFFOLD_PAIRS_Q4_EXPANDED)} scaffold pairs")
+
+        # Flatten scaffold pairs into unique scaffold list
+        all_scaffolds = []
+        for pair in SCAFFOLD_PAIRS_Q4_EXPANDED:
+            all_scaffolds.append({"scaffold": pair["scaffold_a"], "name": pair["name_a"]})
+            all_scaffolds.append({"scaffold": pair["scaffold_b"], "name": pair["name_b"]})
+
+        # Remove duplicates (keep first occurrence)
+        unique_scaffolds_dict = {}
+        for s in all_scaffolds:
+            if s["scaffold"] not in unique_scaffolds_dict:
+                unique_scaffolds_dict[s["scaffold"]] = s
+        unique_scaffolds = list(unique_scaffolds_dict.values())
+
+        print(f"[INFO] Available unique scaffolds: {len(unique_scaffolds)}")
+
+        for num_groups in args.num_groups:
+            if num_groups > len(unique_scaffolds):
+                print(f"[WARN] Skipping num_groups={num_groups} (only {len(unique_scaffolds)} unique scaffolds available)")
+                continue
+
+            for q4_idx in range(args.q4_per_num_groups):
+                counter += 1
+                q4_attempted += 1
+
+                # Try to generate a unique instance
+                for retry in range(max_retries):
+                    try:
+                        # Select N random scaffolds and a linker
+                        selected_scaffolds = rng.sample(unique_scaffolds, num_groups)
+                        linker_smiles, linker_category = get_diverse_linker(rng, min_atoms=6, exclude_benzene=True)
+
+                        inst = generate_q4_instance(
+                            instance_id=f"q4_n{num_groups}_m{args.molecules_per_group}_{counter:05d}",
+                            scaffolds=selected_scaffolds,
+                            linker=linker_smiles,
+                            linker_category=linker_category,
+                            molecules_per_group=args.molecules_per_group,
+                            min_answer_atoms=6,
+                            rng=rng,
+                            max_attempts=50,
+                        )
+
+                        if inst is None:
+                            continue  # Failed to generate, try again
+
+                        # Check for uniqueness (use sorted tuple of all molecules)
+                        # Collect all molecules from all groups dynamically
+                        all_group_molecules = []
+                        for i in range(num_groups):
+                            all_group_molecules.extend(inst.metadata[f"group_{i+1}"])
+                        all_group_molecules.extend(inst.metadata["group_combined"])
+
+                        combo_key = tuple(sorted(all_group_molecules))
+                        if combo_key in seen_q4_combos:
+                            if retry < max_retries - 1:
+                                continue  # Try again
+                            else:
+                                print(f"[WARN] Q4 instance q4_n{num_groups}_m{args.molecules_per_group}_{counter:05d}: Could not find unique combination after {max_retries} retries")
+                                break
+
+                        # Unique combination found!
+                        seen_q4_combos.add(combo_key)
+                        instances.append(inst)
+                        q4_created += 1
+                        break  # Success, move to next instance
+
+                    except (RuntimeError, ValueError) as e:
+                        if retry == max_retries - 1:
+                            print(f"[WARN] Failed to generate Q4 instance q4_n{num_groups}_m{args.molecules_per_group}_{counter:05d}: {e}")
+                        # Otherwise try again
+
+    # Q5 generation (constraint satisfaction)
+    if args.generate_q5:
+        print(f"[INFO] Starting Q5 generation")
+
+        # Define constraint types
+        constraint_types = [
+            "total_carboxylic_acids",
+            "total_aromatic_rings",
+            "total_primary_amines",
+            "total_alcohols",
+            "total_ketones",
+        ]
+
+        for n in args.n_values_q5:
+            # k is approximately 50% of n
+            k = round(n * 0.5)
+
+            for q5_idx in range(args.q5_per_n):
+                counter += 1
+                q5_attempted += 1
+
+                # Cycle through constraint types
+                constraint_type = constraint_types[q5_idx % len(constraint_types)]
+
+                # Try to generate a unique instance
+                for retry in range(max_retries):
+                    try:
+                        inst = generate_q5_instance(
+                            instance_id=f"q5_n{n}_k{k}_{counter:05d}",
+                            bank_index=bank_index,
+                            n_molecules=n,
+                            k_molecules=k,
+                            constraint_type=constraint_type,
+                            target_value=None,  # Will be determined during generation
+                            min_motif_atoms=6,
+                            rng=rng,
+                            max_attempts=100,
+                        )
+
+                        if inst is None:
+                            continue  # Failed to generate, try again
+
+                        # Check for uniqueness
+                        combo_key = tuple(sorted(inst.molecules))
+                        if combo_key in seen_q5_combos:
+                            if retry < max_retries - 1:
+                                continue  # Try again
+                            else:
+                                print(f"[WARN] Q5 instance q5_n{n}_k{k}_{counter:05d}: Could not find unique combination after {max_retries} retries")
+                                break
+
+                        # Unique combination found!
+                        seen_q5_combos.add(combo_key)
+                        instances.append(inst)
+                        q5_created += 1
+                        break  # Success, move to next instance
+
+                    except (RuntimeError, ValueError) as e:
+                        if retry == max_retries - 1:
+                            print(f"[WARN] Failed to generate Q5 instance q5_n{n}_k{k}_{counter:05d}: {e}")
+                        # Otherwise try again
+
     # Print statistics
     print(f"[INFO] Q1a instances: {q1a_created} created out of {q1a_attempted} attempted (unique combinations: {len(seen_q1a_combos)})")
     print(f"[INFO] Q1b instances: {q1b_created} created out of {q1b_attempted} attempted (unique combinations: {len(seen_q1b_combos)})")
     print(f"[INFO] Q2 instances: {q2_created} created out of {q2_attempted} attempted (unique combinations: {len(seen_q2_combos)})")
     print(f"[INFO] Q3 instances: {q3_created} created out of {q3_attempted} attempted (unique combinations: {len(seen_q3_combos)})")
-    total_attempted = q1a_attempted + q1b_attempted + q2_attempted + q3_attempted
-    total_unique = len(seen_q1a_combos) + len(seen_q1b_combos) + len(seen_q2_combos) + len(seen_q3_combos)
+    if args.generate_q4:
+        print(f"[INFO] Q4 instances: {q4_created} created out of {q4_attempted} attempted (unique combinations: {len(seen_q4_combos)})")
+    if args.generate_q5:
+        print(f"[INFO] Q5 instances: {q5_created} created out of {q5_attempted} attempted (unique combinations: {len(seen_q5_combos)})")
+    total_attempted = q1a_attempted + q1b_attempted + q2_attempted + q3_attempted + q4_attempted + q5_attempted
+    total_unique = len(seen_q1a_combos) + len(seen_q1b_combos) + len(seen_q2_combos) + len(seen_q3_combos) + len(seen_q4_combos) + len(seen_q5_combos)
     print(f"[INFO] Total instances: {len(instances)} created out of {total_attempted} attempted")
     print(f"[INFO] Total unique molecule combinations: {total_unique}")
 
@@ -303,19 +468,22 @@ def main():
         "q1a_largest_common_motif_chembl": "REL-C2",
         "q1b_largest_common_motif_scaffold": "REL-C2",
         "q3_missing_isomers": "REL-C3",
+        "q4_avoid_scaffolds": "REL-C4",
+        "q5_constraint_satisfaction_selection": "REL-C5",
     }
 
     def convert_to_unified_format(inst):
         """Convert a BenchmarkInstance to unified JSONL format."""
         # Map task name to REL-C* format
         unified_task = TASK_MAPPING.get(inst.task, inst.task)
-        
+
         # Build unified answer structure
         unified_answer = {}
-        
-        # Add molecules to answer (present in all chemistry tasks)
-        unified_answer["molecules"] = inst.molecules
-        
+
+        # Add molecules to answer (present in most chemistry tasks)
+        if inst.molecules:
+            unified_answer["molecules"] = inst.molecules
+
         # Add task-specific answer fields
         if "label" in inst.answer:
             unified_answer["label"] = inst.answer["label"]
@@ -323,7 +491,11 @@ def main():
             unified_answer["smiles"] = inst.answer["smiles"]
         if "missing_smiles" in inst.answer:
             unified_answer["missing_smiles"] = inst.answer["missing_smiles"]
-        
+        if "selected_molecule_indices" in inst.answer:
+            unified_answer["selected_molecule_indices"] = inst.answer["selected_molecule_indices"]
+        if "selected_motifs" in inst.answer:
+            unified_answer["selected_motifs"] = inst.answer["selected_motifs"]
+
         # Build unified record
         unified_record = {
             "id": inst.id,
@@ -333,10 +505,10 @@ def main():
             "answer": unified_answer,
             "metadata": inst.metadata.copy() if inst.metadata else {},
         }
-        
+
         # Add original task name to metadata
         unified_record["metadata"]["original_task"] = inst.task
-        
+
         return unified_record
 
     # Write JSONL in unified format

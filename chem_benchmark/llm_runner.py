@@ -47,6 +47,50 @@ def extract_yesno_tag(text: str) -> Optional[str]:
     return m.group(1).capitalize()
 
 
+def extract_indices_and_motifs(text: str) -> Tuple[Optional[List[int]], Optional[Dict[str, str]]]:
+    """
+    Extract molecule indices and their corresponding motifs from REL-C5 response.
+
+    Expected format:
+    <indices>1, 3, 5</indices>
+    <motif_1>CCCCCC</motif_1>
+    <motif_3>C1CCCCC1</motif_3>
+    <motif_5>c1ccccc1</motif_5>
+
+    Returns:
+        Tuple of (indices, motifs) where:
+        - indices: list of ints, or None if not found
+        - motifs: dict mapping str(index) -> SMILES, or None if not found
+    """
+    if not isinstance(text, str):
+        return None, None
+
+    # Extract indices
+    indices_match = re.search(r"<indices>\s*([^<]+?)\s*</indices>", text, re.IGNORECASE)
+    if not indices_match:
+        return None, None
+
+    # Parse comma-separated indices
+    indices_str = indices_match.group(1)
+    try:
+        indices = [int(x.strip()) for x in indices_str.split(",") if x.strip()]
+    except ValueError:
+        return None, None
+
+    # Extract motifs for each index
+    motifs = {}
+    for idx in indices:
+        motif_pattern = rf"<motif_{idx}>\s*([^<\n\r]+?)\s*</motif_{idx}>"
+        motif_match = re.search(motif_pattern, text, re.IGNORECASE)
+        if motif_match:
+            motifs[str(idx)] = motif_match.group(1).strip()
+        else:
+            # Missing motif for this index
+            return indices, None
+
+    return indices, motifs
+
+
 # -----------------------------
 # OpenAI API caller (Chat Completions)
 # -----------------------------
@@ -118,9 +162,24 @@ def call_openai_response(prompt: str, cfg: OpenAIChatConfig) -> str:
 
 
 def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
-    # works for GPT-4o-mini
+    # works for GPT-4o-mini and Azure OpenAI
     url = cfg.base_url.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
+
+    # Azure uses api-key header, standard OpenAI uses Authorization Bearer
+    is_azure = "azure" in cfg.base_url.lower() or "hms.edu" in cfg.base_url.lower()
+    if is_azure:
+        headers = {"api-key": cfg.api_key, "Content-Type": "application/json"}
+        # Azure requires api-version query parameter
+        url += "?api-version=2024-12-01-preview"
+    else:
+        headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
+
+    # GPT-5.x uses max_completion_tokens instead of max_tokens
+    if cfg.model.startswith("gpt-5") or cfg.model.startswith("o1") or cfg.model.startswith("o3"):
+        max_tokens_key = "max_completion_tokens"
+    else:
+        max_tokens_key = "max_tokens"
+
     payload = {
         "model": cfg.model,
         "messages": [
@@ -128,7 +187,7 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": cfg.temperature,
-        "max_tokens": cfg.max_tokens,
+        max_tokens_key: cfg.max_tokens,
     }
 
     last_err = None
@@ -659,6 +718,16 @@ def score_instance(instance: Dict[str, Any], model_text: str) -> Dict[str, Any]:
     task = instance["task"]
     gold = instance["answer"]
 
+    # Map unified format task names to internal names
+    task_mapping = {
+        "REL-C1": "q2_isomer_set_yes_no",
+        "REL-C2": "q1a_largest_common_motif_chembl",  # Both Q1a and Q1b map to same scoring
+        "REL-C3": "q3_missing_isomers",
+        "REL-C4": "q4_avoid_scaffolds",
+        "REL-C5": "q5_constraint_satisfaction_selection",
+    }
+    task = task_mapping.get(task, task)
+
     # Q1a and Q1b both use the same scoring logic as Q1
     if task in ("q1_largest_common_motif", "q1a_largest_common_motif_chembl", "q1b_largest_common_motif_scaffold"):
         pred = extract_first_smiles_tag(model_text)
@@ -700,6 +769,137 @@ def score_instance(instance: Dict[str, Any], model_text: str) -> Dict[str, Any]:
             "recall": rec,
             "f1": f1,
             "correct": exact,
+        }
+
+    if task == "q4_avoid_scaffolds":
+        # Use enhanced evaluation from evaluation.py
+        from .evaluation import evaluate_c4_response
+        metadata = instance.get("metadata", {})
+        # Pass empty string for question (not used in evaluation)
+        return evaluate_c4_response("", gold, model_text, metadata)
+
+    if task == "q5_constraint_satisfaction_selection":
+        from rdkit import Chem
+        from .functional_groups import count_functional_groups, count_aromatic_rings
+
+        # Extract metadata
+        metadata = instance.get("metadata", {})
+        constraint_type = metadata.get("constraint_type")
+        target_value = metadata.get("target_value")
+        k_molecules = metadata.get("k_molecules")
+        min_motif_atoms = metadata.get("min_motif_atoms", 6)
+        molecules = gold.get("molecules", [])
+
+        # For reference (not used for validation, but kept for comparison)
+        gold_indices = gold.get("selected_molecule_indices", [])
+        gold_motifs = gold.get("selected_motifs", {})
+
+        # Parse LLM response
+        pred_indices, pred_motifs = extract_indices_and_motifs(model_text)
+
+        # Validation checks
+        errors = []
+        constraint_satisfied = False
+        actual_total = None
+
+        # 1. Check if we extracted indices and motifs
+        if pred_indices is None or pred_motifs is None:
+            errors.append("Failed to parse response")
+            return {
+                "pred_indices": pred_indices,
+                "pred_motifs": pred_motifs,
+                "gold_indices": gold_indices,
+                "gold_motifs": gold_motifs,
+                "correct": False,
+                "constraint_satisfied": False,
+                "errors": errors,
+            }
+
+        # 2. Check selected exactly k molecules
+        if len(pred_indices) != k_molecules:
+            errors.append(f"Selected {len(pred_indices)} molecules, expected {k_molecules}")
+
+        # 3. Check each selected molecule has a motif
+        if set(pred_motifs.keys()) != set(str(i) for i in pred_indices):
+            errors.append("Missing motifs for some selected molecules")
+
+        # 4. Validate each motif is a substructure and has enough atoms
+        from rdkit import Chem
+        for idx_str, motif_smiles in pred_motifs.items():
+            try:
+                mol_idx = int(idx_str)
+                if mol_idx < 0 or mol_idx >= len(molecules):
+                    errors.append(f"Invalid molecule index: {mol_idx}")
+                    continue
+
+                mol_smiles = molecules[mol_idx]
+                motif_mol = Chem.MolFromSmiles(motif_smiles)
+                parent_mol = Chem.MolFromSmiles(mol_smiles)
+
+                if motif_mol is None:
+                    errors.append(f"Invalid SMILES for motif at index {mol_idx}: {motif_smiles}")
+                    continue
+
+                if parent_mol is None:
+                    errors.append(f"Invalid SMILES for parent molecule at index {mol_idx}")
+                    continue
+
+                # Check substructure
+                if not parent_mol.HasSubstructMatch(motif_mol):
+                    errors.append(f"Motif at index {mol_idx} is not a substructure of the parent molecule")
+
+                # Check minimum atoms
+                num_atoms = motif_mol.GetNumHeavyAtoms()
+                if num_atoms < min_motif_atoms:
+                    errors.append(f"Motif at index {mol_idx} has {num_atoms} atoms, minimum is {min_motif_atoms}")
+
+            except Exception as e:
+                errors.append(f"Error validating motif at index {idx_str}: {e}")
+
+        # 5. Check constraint satisfaction (only if no validation errors so far)
+        if not errors:
+            try:
+                actual_total = 0
+                for motif_smiles in pred_motifs.values():
+                    motif_mol = Chem.MolFromSmiles(motif_smiles)
+                    if motif_mol is None:
+                        continue
+
+                    if constraint_type == "total_aromatic_rings":
+                        value = count_aromatic_rings(motif_mol)
+                    elif constraint_type and constraint_type.startswith("total_"):
+                        # Extract functional group name
+                        fg_key = constraint_type[6:]  # Remove "total_" prefix
+                        if fg_key.endswith("s"):
+                            fg_key = fg_key[:-1]  # Remove plural "s"
+                        fg_counts = count_functional_groups(motif_mol)
+                        value = fg_counts.get(fg_key, 0)
+                    else:
+                        fg_counts = count_functional_groups(motif_mol)
+                        value = fg_counts.get(constraint_type, 0)
+
+                    actual_total += value
+
+                constraint_satisfied = (actual_total == target_value)
+                if not constraint_satisfied:
+                    errors.append(f"Constraint not satisfied: {constraint_type}={actual_total}, expected {target_value}")
+
+            except Exception as e:
+                errors.append(f"Error checking constraint: {e}")
+
+        # Overall correct if constraint is satisfied and no errors
+        correct = constraint_satisfied and len(errors) == 0
+
+        return {
+            "pred_indices": pred_indices,
+            "pred_motifs": pred_motifs,
+            "gold_indices": gold_indices,  # Reference only
+            "gold_motifs": gold_motifs,    # Reference only
+            "correct": correct,
+            "constraint_satisfied": constraint_satisfied,
+            "actual_total": actual_total,
+            "expected_total": target_value,
+            "errors": errors if errors else None,
         }
 
     return {"error": f"Unknown task: {task}", "correct": False}
@@ -783,7 +983,11 @@ def main():
             max_tokens=args.max_tokens,
             temperature=args.temperature,
         )
-        call_func = call_openai_response
+        # Use chat completions for Azure, responses API for standard OpenAI
+        if "azure" in args.base_url.lower() or "hms.edu" in args.base_url.lower():
+            call_func = call_openai_chat
+        else:
+            call_func = call_openai_response
     elif args.provider == "claude":
         cfg = ClaudeChatConfig(
             model=args.model,
@@ -846,13 +1050,25 @@ def main():
     rows = []
     with out_path.open("w", encoding="utf-8") as f_out:
         for inst in all_instances:
-            text = call_func(inst["prompt"], cfg)
+            # Handle both "prompt" (old format) and "question" (unified format)
+            prompt_text = inst.get("question") or inst.get("prompt")
+            if not prompt_text:
+                raise ValueError(f"Instance {inst['id']} missing both 'question' and 'prompt' fields")
+
+            text = call_func(prompt_text, cfg)
             score = score_instance(inst, text)
+
+            # Get n_molecules from various possible locations
+            n_mols = inst.get("n_molecules")
+            if n_mols is None and "metadata" in inst:
+                n_mols = inst["metadata"].get("n_molecules")
+            if n_mols is None and "answer" in inst and "molecules" in inst["answer"]:
+                n_mols = len(inst["answer"]["molecules"])
 
             row = {
                 "id": inst["id"],
                 "task": inst["task"],
-                "n_molecules": inst["n_molecules"],
+                "n_molecules": n_mols,
                 "model": args.model,
                 "response_text": text,
                 "score": score,
