@@ -111,6 +111,10 @@ class OpenAIChatConfig:
     max_retries: int = 6
     min_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
+    # Rate limit specific retry/backoff (for 429 errors)
+    max_retries_rate_limit: int = 15
+    rate_limit_min_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 300.0
 
 
 def call_openai_response(prompt: str, cfg: OpenAIChatConfig) -> str:
@@ -191,14 +195,51 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
     }
 
     last_err = None
-    for attempt in range(cfg.max_retries):
+    is_rate_limit = False
+    max_attempts = cfg.max_retries
+
+    for attempt in range(max_attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout_s)
-            if r.status_code in (429, 500, 502, 503, 504):
+
+            # Handle rate limiting (429) with special backoff
+            if r.status_code == 429:
+                is_rate_limit = True
+                # Parse Retry-After header if available
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                        print(f"[Rate Limit] API requested retry after {wait_time}s (attempt {attempt + 1}/{max_attempts})")
+                    except ValueError:
+                        wait_time = None
+                else:
+                    wait_time = None
+
+                # If this is our first rate limit hit, extend max attempts
+                if attempt < cfg.max_retries:
+                    max_attempts = cfg.max_retries_rate_limit
+                    print(f"[Rate Limit] Extending max attempts to {max_attempts} for rate limit handling")
+
+                # Use Retry-After header if available, otherwise use exponential backoff
+                if wait_time:
+                    backoff = min(cfg.rate_limit_max_backoff_s, wait_time)
+                else:
+                    backoff = min(cfg.rate_limit_max_backoff_s, cfg.rate_limit_min_backoff_s * (2 ** attempt))
+                    backoff = backoff * (0.7 + 0.6 * random.random())
+
+                print(f"[Rate Limit] Waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                continue
+
+            # Handle other retryable errors
+            if r.status_code in (500, 502, 503, 504):
                 raise RuntimeError(f"retryable_status={r.status_code} body={r.text[:300]}")
+
             r.raise_for_status()
             data = r.json()
             return data["choices"][0]["message"]["content"]
+
         except requests.exceptions.HTTPError as e:
             # For 400 errors, show the actual API error message
             if r.status_code == 400:
@@ -212,7 +253,7 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
             if r.status_code in (400, 401):
                 raise
             last_err = e
-            # exponential backoff with jitter
+            # exponential backoff with jitter (for non-429 errors)
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
@@ -223,7 +264,7 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
 
-    raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
+    raise RuntimeError(f"OpenAI call failed after {max_attempts} retries: {last_err}")
 
 
 # -----------------------------
@@ -246,6 +287,10 @@ class ClaudeChatConfig:
     max_retries: int = 6
     min_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
+    # Rate limit specific retry/backoff (for 429 errors)
+    max_retries_rate_limit: int = 15
+    rate_limit_min_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 300.0
 
 
 def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
@@ -258,7 +303,7 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json"
     }
-    
+
     payload = {
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
@@ -268,16 +313,52 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
             {"role": "user", "content": prompt}
         ]
     }
-    
+
     last_err = None
-    for attempt in range(cfg.max_retries):
+    is_rate_limit = False
+    max_attempts = cfg.max_retries
+
+    for attempt in range(max_attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout_s)
-            if r.status_code in (429, 500, 502, 503, 504):
+
+            # Handle rate limiting (429) with special backoff
+            if r.status_code == 429:
+                is_rate_limit = True
+                # Parse Retry-After header if available
+                retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                        print(f"[Rate Limit] API requested retry after {wait_time}s (attempt {attempt + 1}/{max_attempts})")
+                    except ValueError:
+                        wait_time = None
+                else:
+                    wait_time = None
+
+                # If this is our first rate limit hit, extend max attempts
+                if attempt < cfg.max_retries:
+                    max_attempts = cfg.max_retries_rate_limit
+                    print(f"[Rate Limit] Extending max attempts to {max_attempts} for rate limit handling")
+
+                # Use Retry-After header if available, otherwise use exponential backoff
+                if wait_time:
+                    backoff = min(cfg.rate_limit_max_backoff_s, wait_time)
+                else:
+                    backoff = min(cfg.rate_limit_max_backoff_s, cfg.rate_limit_min_backoff_s * (2 ** attempt))
+                    backoff = backoff * (0.7 + 0.6 * random.random())
+
+                print(f"[Rate Limit] Waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                continue
+
+            # Handle other retryable errors
+            if r.status_code in (500, 502, 503, 504):
                 raise RuntimeError(f"retryable_status={r.status_code} body={r.text[:300]}")
+
             r.raise_for_status()
             data = r.json()
-            
+
             # Extract text from content array
             content = data.get("content", [])
             if isinstance(content, list) and len(content) > 0:
@@ -290,7 +371,7 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
                 return content.strip()
             else:
                 raise RuntimeError(f"Unexpected Claude response format: {data}")
-                
+
         except requests.exceptions.HTTPError as e:
             # For 400/404 errors, show the actual API error message
             if r.status_code in (400, 404):
@@ -304,7 +385,7 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
             if r.status_code in (400, 401, 404):
                 raise
             last_err = e
-            # exponential backoff with jitter
+            # exponential backoff with jitter (for non-429 errors)
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
@@ -314,8 +395,8 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
-    
-    raise RuntimeError(f"Claude call failed after retries: {last_err}")
+
+    raise RuntimeError(f"Claude call failed after {max_attempts} retries: {last_err}")
 
 
 # -----------------------------
@@ -345,6 +426,10 @@ class GeminiChatConfig:
     max_retries: int = 6
     min_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
+    # Rate limit specific retry/backoff (for 429 errors)
+    max_retries_rate_limit: int = 15
+    rate_limit_min_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 300.0
 
 
 def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
@@ -394,11 +479,47 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
         }
     
     last_err = None
-    for attempt in range(cfg.max_retries):
+    is_rate_limit = False
+    max_attempts = cfg.max_retries
+
+    for attempt in range(max_attempts):
         try:
             r = requests.post(url, params=params, json=payload, timeout=cfg.timeout_s)
-            if r.status_code in (429, 500, 502, 503, 504):
+
+            # Handle rate limiting (429) with special backoff
+            if r.status_code == 429:
+                is_rate_limit = True
+                # Parse Retry-After header if available
+                retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                        print(f"[Rate Limit] API requested retry after {wait_time}s (attempt {attempt + 1}/{max_attempts})")
+                    except ValueError:
+                        wait_time = None
+                else:
+                    wait_time = None
+
+                # If this is our first rate limit hit, extend max attempts
+                if attempt < cfg.max_retries:
+                    max_attempts = cfg.max_retries_rate_limit
+                    print(f"[Rate Limit] Extending max attempts to {max_attempts} for rate limit handling")
+
+                # Use Retry-After header if available, otherwise use exponential backoff
+                if wait_time:
+                    backoff = min(cfg.rate_limit_max_backoff_s, wait_time)
+                else:
+                    backoff = min(cfg.rate_limit_max_backoff_s, cfg.rate_limit_min_backoff_s * (2 ** attempt))
+                    backoff = backoff * (0.7 + 0.6 * random.random())
+
+                print(f"[Rate Limit] Waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                continue
+
+            # Handle other retryable errors
+            if r.status_code in (500, 502, 503, 504):
                 raise RuntimeError(f"retryable_status={r.status_code} body={r.text[:300]}")
+
             r.raise_for_status()
             data = r.json()
 
@@ -696,7 +817,7 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
             if r.status_code in (400, 401):
                 raise
             last_err = e
-            # exponential backoff with jitter
+            # exponential backoff with jitter (for non-429 errors)
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
@@ -706,8 +827,8 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
-    
-    raise RuntimeError(f"Gemini call failed after retries: {last_err}")
+
+    raise RuntimeError(f"Gemini call failed after {max_attempts} retries: {last_err}")
 
 
 # -----------------------------
@@ -1047,34 +1168,67 @@ def main():
         all_instances = selected_instances
         print(f"[TEST MODE] Processing {len(all_instances)} total instances (test_mode={args.test_mode})")
 
+    # Load existing results for resumption
+    processed_ids = set()
     rows = []
-    with out_path.open("w", encoding="utf-8") as f_out:
-        for inst in all_instances:
-            # Handle both "prompt" (old format) and "question" (unified format)
-            prompt_text = inst.get("question") or inst.get("prompt")
-            if not prompt_text:
-                raise ValueError(f"Instance {inst['id']} missing both 'question' and 'prompt' fields")
+    if out_path.exists():
+        print(f"[RESUME] Found existing results file: {out_path}")
+        with out_path.open("r", encoding="utf-8") as f_in:
+            for line in f_in:
+                try:
+                    row = json.loads(line)
+                    processed_ids.add(row["id"])
+                    rows.append(row)  # Keep existing results in memory for summary
+                except json.JSONDecodeError:
+                    print(f"[RESUME WARNING] Skipping invalid JSON line in existing results")
+                    continue
+        print(f"[RESUME] Loaded {len(processed_ids)} existing results")
 
-            text = call_func(prompt_text, cfg)
-            score = score_instance(inst, text)
+    # Filter to unprocessed instances
+    original_count = len(all_instances)
+    all_instances = [inst for inst in all_instances if inst["id"] not in processed_ids]
+    skipped_count = original_count - len(all_instances)
 
-            # Get n_molecules from various possible locations
-            n_mols = inst.get("n_molecules")
-            if n_mols is None and "metadata" in inst:
-                n_mols = inst["metadata"].get("n_molecules")
-            if n_mols is None and "answer" in inst and "molecules" in inst["answer"]:
-                n_mols = len(inst["answer"]["molecules"])
+    if skipped_count > 0:
+        print(f"[RESUME] Skipping {skipped_count} already-processed instances")
+    print(f"[PROGRESS] Processing {len(all_instances)} remaining instances")
 
-            row = {
-                "id": inst["id"],
-                "task": inst["task"],
-                "n_molecules": n_mols,
-                "model": args.model,
-                "response_text": text,
-                "score": score,
-            }
-            rows.append(row)
-            f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if len(all_instances) == 0:
+        print(f"[RESUME] All instances already processed, nothing to do")
+    else:
+        # Open in append mode to preserve existing results
+        with out_path.open("a", encoding="utf-8") as f_out:
+            for idx, inst in enumerate(all_instances, 1):
+                # Handle both "prompt" (old format) and "question" (unified format)
+                prompt_text = inst.get("question") or inst.get("prompt")
+                if not prompt_text:
+                    raise ValueError(f"Instance {inst['id']} missing both 'question' and 'prompt' fields")
+
+                print(f"[PROGRESS] Processing instance {idx}/{len(all_instances)} (ID: {inst['id']}, Task: {inst['task']})")
+
+                text = call_func(prompt_text, cfg)
+                score = score_instance(inst, text)
+
+                # Get n_molecules from various possible locations
+                n_mols = inst.get("n_molecules")
+                if n_mols is None and "metadata" in inst:
+                    n_mols = inst["metadata"].get("n_molecules")
+                if n_mols is None and "answer" in inst and "molecules" in inst["answer"]:
+                    n_mols = len(inst["answer"]["molecules"])
+
+                row = {
+                    "id": inst["id"],
+                    "task": inst["task"],
+                    "n_molecules": n_mols,
+                    "model": args.model,
+                    "response_text": text,
+                    "score": score,
+                }
+                rows.append(row)
+                f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f_out.flush()  # Ensure data is written immediately
+
+                print(f"[PROGRESS] Completed instance {idx}/{len(all_instances)} - Correct: {score.get('correct', False)}")
 
     summary = summarize_scores(rows)
     summary_path = out_path.with_suffix(".summary.json")
