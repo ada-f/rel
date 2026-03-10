@@ -47,6 +47,50 @@ def extract_yesno_tag(text: str) -> Optional[str]:
     return m.group(1).capitalize()
 
 
+def extract_indices_and_motifs(text: str) -> Tuple[Optional[List[int]], Optional[Dict[str, str]]]:
+    """
+    Extract molecule indices and their corresponding motifs from REL-C5 response.
+
+    Expected format:
+    <indices>1, 3, 5</indices>
+    <motif_1>CCCCCC</motif_1>
+    <motif_3>C1CCCCC1</motif_3>
+    <motif_5>c1ccccc1</motif_5>
+
+    Returns:
+        Tuple of (indices, motifs) where:
+        - indices: list of ints, or None if not found
+        - motifs: dict mapping str(index) -> SMILES, or None if not found
+    """
+    if not isinstance(text, str):
+        return None, None
+
+    # Extract indices
+    indices_match = re.search(r"<indices>\s*([^<]+?)\s*</indices>", text, re.IGNORECASE)
+    if not indices_match:
+        return None, None
+
+    # Parse comma-separated indices
+    indices_str = indices_match.group(1)
+    try:
+        indices = [int(x.strip()) for x in indices_str.split(",") if x.strip()]
+    except ValueError:
+        return None, None
+
+    # Extract motifs for each index
+    motifs = {}
+    for idx in indices:
+        motif_pattern = rf"<motif_{idx}>\s*([^<\n\r]+?)\s*</motif_{idx}>"
+        motif_match = re.search(motif_pattern, text, re.IGNORECASE)
+        if motif_match:
+            motifs[str(idx)] = motif_match.group(1).strip()
+        else:
+            # Missing motif for this index
+            return indices, None
+
+    return indices, motifs
+
+
 # -----------------------------
 # OpenAI API caller (Chat Completions)
 # -----------------------------
@@ -67,6 +111,10 @@ class OpenAIChatConfig:
     max_retries: int = 6
     min_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
+    # Rate limit specific retry/backoff (for 429 errors)
+    max_retries_rate_limit: int = 15
+    rate_limit_min_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 300.0
 
 
 def call_openai_response(prompt: str, cfg: OpenAIChatConfig) -> str:
@@ -118,9 +166,24 @@ def call_openai_response(prompt: str, cfg: OpenAIChatConfig) -> str:
 
 
 def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
-    # works for GPT-4o-mini
+    # works for GPT-4o-mini and Azure OpenAI
     url = cfg.base_url.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
+
+    # Azure uses api-key header, standard OpenAI uses Authorization Bearer
+    is_azure = "azure" in cfg.base_url.lower() or "hms.edu" in cfg.base_url.lower()
+    if is_azure:
+        headers = {"api-key": cfg.api_key, "Content-Type": "application/json"}
+        # Azure requires api-version query parameter
+        url += "?api-version=2024-12-01-preview"
+    else:
+        headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
+
+    # GPT-5.x uses max_completion_tokens instead of max_tokens
+    if cfg.model.startswith("gpt-5") or cfg.model.startswith("o1") or cfg.model.startswith("o3"):
+        max_tokens_key = "max_completion_tokens"
+    else:
+        max_tokens_key = "max_tokens"
+
     payload = {
         "model": cfg.model,
         "messages": [
@@ -128,18 +191,55 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": cfg.temperature,
-        "max_tokens": cfg.max_tokens,
+        max_tokens_key: cfg.max_tokens,
     }
 
     last_err = None
-    for attempt in range(cfg.max_retries):
+    is_rate_limit = False
+    max_attempts = cfg.max_retries
+
+    for attempt in range(max_attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout_s)
-            if r.status_code in (429, 500, 502, 503, 504):
+
+            # Handle rate limiting (429) with special backoff
+            if r.status_code == 429:
+                is_rate_limit = True
+                # Parse Retry-After header if available
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                        print(f"[Rate Limit] API requested retry after {wait_time}s (attempt {attempt + 1}/{max_attempts})")
+                    except ValueError:
+                        wait_time = None
+                else:
+                    wait_time = None
+
+                # If this is our first rate limit hit, extend max attempts
+                if attempt < cfg.max_retries:
+                    max_attempts = cfg.max_retries_rate_limit
+                    print(f"[Rate Limit] Extending max attempts to {max_attempts} for rate limit handling")
+
+                # Use Retry-After header if available, otherwise use exponential backoff
+                if wait_time:
+                    backoff = min(cfg.rate_limit_max_backoff_s, wait_time)
+                else:
+                    backoff = min(cfg.rate_limit_max_backoff_s, cfg.rate_limit_min_backoff_s * (2 ** attempt))
+                    backoff = backoff * (0.7 + 0.6 * random.random())
+
+                print(f"[Rate Limit] Waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                continue
+
+            # Handle other retryable errors
+            if r.status_code in (500, 502, 503, 504):
                 raise RuntimeError(f"retryable_status={r.status_code} body={r.text[:300]}")
+
             r.raise_for_status()
             data = r.json()
             return data["choices"][0]["message"]["content"]
+
         except requests.exceptions.HTTPError as e:
             # For 400 errors, show the actual API error message
             if r.status_code == 400:
@@ -153,7 +253,7 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
             if r.status_code in (400, 401):
                 raise
             last_err = e
-            # exponential backoff with jitter
+            # exponential backoff with jitter (for non-429 errors)
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
@@ -164,7 +264,7 @@ def call_openai_chat(prompt: str, cfg: OpenAIChatConfig) -> str:
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
 
-    raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
+    raise RuntimeError(f"OpenAI call failed after {max_attempts} retries: {last_err}")
 
 
 # -----------------------------
@@ -187,6 +287,10 @@ class ClaudeChatConfig:
     max_retries: int = 6
     min_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
+    # Rate limit specific retry/backoff (for 429 errors)
+    max_retries_rate_limit: int = 15
+    rate_limit_min_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 300.0
 
 
 def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
@@ -199,7 +303,7 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json"
     }
-    
+
     payload = {
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
@@ -209,16 +313,52 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
             {"role": "user", "content": prompt}
         ]
     }
-    
+
     last_err = None
-    for attempt in range(cfg.max_retries):
+    is_rate_limit = False
+    max_attempts = cfg.max_retries
+
+    for attempt in range(max_attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout_s)
-            if r.status_code in (429, 500, 502, 503, 504):
+
+            # Handle rate limiting (429) with special backoff
+            if r.status_code == 429:
+                is_rate_limit = True
+                # Parse Retry-After header if available
+                retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                        print(f"[Rate Limit] API requested retry after {wait_time}s (attempt {attempt + 1}/{max_attempts})")
+                    except ValueError:
+                        wait_time = None
+                else:
+                    wait_time = None
+
+                # If this is our first rate limit hit, extend max attempts
+                if attempt < cfg.max_retries:
+                    max_attempts = cfg.max_retries_rate_limit
+                    print(f"[Rate Limit] Extending max attempts to {max_attempts} for rate limit handling")
+
+                # Use Retry-After header if available, otherwise use exponential backoff
+                if wait_time:
+                    backoff = min(cfg.rate_limit_max_backoff_s, wait_time)
+                else:
+                    backoff = min(cfg.rate_limit_max_backoff_s, cfg.rate_limit_min_backoff_s * (2 ** attempt))
+                    backoff = backoff * (0.7 + 0.6 * random.random())
+
+                print(f"[Rate Limit] Waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                continue
+
+            # Handle other retryable errors
+            if r.status_code in (500, 502, 503, 504):
                 raise RuntimeError(f"retryable_status={r.status_code} body={r.text[:300]}")
+
             r.raise_for_status()
             data = r.json()
-            
+
             # Extract text from content array
             content = data.get("content", [])
             if isinstance(content, list) and len(content) > 0:
@@ -231,7 +371,7 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
                 return content.strip()
             else:
                 raise RuntimeError(f"Unexpected Claude response format: {data}")
-                
+
         except requests.exceptions.HTTPError as e:
             # For 400/404 errors, show the actual API error message
             if r.status_code in (400, 404):
@@ -245,7 +385,7 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
             if r.status_code in (400, 401, 404):
                 raise
             last_err = e
-            # exponential backoff with jitter
+            # exponential backoff with jitter (for non-429 errors)
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
@@ -255,8 +395,8 @@ def call_claude(prompt: str, cfg: ClaudeChatConfig) -> str:
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
-    
-    raise RuntimeError(f"Claude call failed after retries: {last_err}")
+
+    raise RuntimeError(f"Claude call failed after {max_attempts} retries: {last_err}")
 
 
 # -----------------------------
@@ -286,6 +426,10 @@ class GeminiChatConfig:
     max_retries: int = 6
     min_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
+    # Rate limit specific retry/backoff (for 429 errors)
+    max_retries_rate_limit: int = 15
+    rate_limit_min_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 300.0
 
 
 def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
@@ -335,11 +479,47 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
         }
     
     last_err = None
-    for attempt in range(cfg.max_retries):
+    is_rate_limit = False
+    max_attempts = cfg.max_retries
+
+    for attempt in range(max_attempts):
         try:
             r = requests.post(url, params=params, json=payload, timeout=cfg.timeout_s)
-            if r.status_code in (429, 500, 502, 503, 504):
+
+            # Handle rate limiting (429) with special backoff
+            if r.status_code == 429:
+                is_rate_limit = True
+                # Parse Retry-After header if available
+                retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                        print(f"[Rate Limit] API requested retry after {wait_time}s (attempt {attempt + 1}/{max_attempts})")
+                    except ValueError:
+                        wait_time = None
+                else:
+                    wait_time = None
+
+                # If this is our first rate limit hit, extend max attempts
+                if attempt < cfg.max_retries:
+                    max_attempts = cfg.max_retries_rate_limit
+                    print(f"[Rate Limit] Extending max attempts to {max_attempts} for rate limit handling")
+
+                # Use Retry-After header if available, otherwise use exponential backoff
+                if wait_time:
+                    backoff = min(cfg.rate_limit_max_backoff_s, wait_time)
+                else:
+                    backoff = min(cfg.rate_limit_max_backoff_s, cfg.rate_limit_min_backoff_s * (2 ** attempt))
+                    backoff = backoff * (0.7 + 0.6 * random.random())
+
+                print(f"[Rate Limit] Waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                continue
+
+            # Handle other retryable errors
+            if r.status_code in (500, 502, 503, 504):
                 raise RuntimeError(f"retryable_status={r.status_code} body={r.text[:300]}")
+
             r.raise_for_status()
             data = r.json()
 
@@ -637,7 +817,7 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
             if r.status_code in (400, 401):
                 raise
             last_err = e
-            # exponential backoff with jitter
+            # exponential backoff with jitter (for non-429 errors)
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
@@ -647,8 +827,8 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
             backoff = min(cfg.max_backoff_s, cfg.min_backoff_s * (2 ** attempt))
             backoff = backoff * (0.7 + 0.6 * random.random())
             time.sleep(backoff)
-    
-    raise RuntimeError(f"Gemini call failed after retries: {last_err}")
+
+    raise RuntimeError(f"Gemini call failed after {max_attempts} retries: {last_err}")
 
 
 # -----------------------------
@@ -658,6 +838,16 @@ def call_gemini(prompt: str, cfg: GeminiChatConfig) -> str:
 def score_instance(instance: Dict[str, Any], model_text: str) -> Dict[str, Any]:
     task = instance["task"]
     gold = instance["answer"]
+
+    # Map unified format task names to internal names
+    task_mapping = {
+        "REL-C1": "q2_isomer_set_yes_no",
+        "REL-C2": "q1a_largest_common_motif_chembl",  # Both Q1a and Q1b map to same scoring
+        "REL-C3": "q3_missing_isomers",
+        "REL-C4": "q4_avoid_scaffolds",
+        "REL-C5": "q5_constraint_satisfaction_selection",
+    }
+    task = task_mapping.get(task, task)
 
     # Q1a and Q1b both use the same scoring logic as Q1
     if task in ("q1_largest_common_motif", "q1a_largest_common_motif_chembl", "q1b_largest_common_motif_scaffold"):
@@ -702,6 +892,137 @@ def score_instance(instance: Dict[str, Any], model_text: str) -> Dict[str, Any]:
             "correct": exact,
         }
 
+    if task == "q4_avoid_scaffolds":
+        # Use enhanced evaluation from evaluation.py
+        from .evaluation import evaluate_c4_response
+        metadata = instance.get("metadata", {})
+        # Pass empty string for question (not used in evaluation)
+        return evaluate_c4_response("", gold, model_text, metadata)
+
+    if task == "q5_constraint_satisfaction_selection":
+        from rdkit import Chem
+        from .functional_groups import count_functional_groups, count_aromatic_rings
+
+        # Extract metadata
+        metadata = instance.get("metadata", {})
+        constraint_type = metadata.get("constraint_type")
+        target_value = metadata.get("target_value")
+        k_molecules = metadata.get("k_molecules")
+        min_motif_atoms = metadata.get("min_motif_atoms", 6)
+        molecules = gold.get("molecules", [])
+
+        # For reference (not used for validation, but kept for comparison)
+        gold_indices = gold.get("selected_molecule_indices", [])
+        gold_motifs = gold.get("selected_motifs", {})
+
+        # Parse LLM response
+        pred_indices, pred_motifs = extract_indices_and_motifs(model_text)
+
+        # Validation checks
+        errors = []
+        constraint_satisfied = False
+        actual_total = None
+
+        # 1. Check if we extracted indices and motifs
+        if pred_indices is None or pred_motifs is None:
+            errors.append("Failed to parse response")
+            return {
+                "pred_indices": pred_indices,
+                "pred_motifs": pred_motifs,
+                "gold_indices": gold_indices,
+                "gold_motifs": gold_motifs,
+                "correct": False,
+                "constraint_satisfied": False,
+                "errors": errors,
+            }
+
+        # 2. Check selected exactly k molecules
+        if len(pred_indices) != k_molecules:
+            errors.append(f"Selected {len(pred_indices)} molecules, expected {k_molecules}")
+
+        # 3. Check each selected molecule has a motif
+        if set(pred_motifs.keys()) != set(str(i) for i in pred_indices):
+            errors.append("Missing motifs for some selected molecules")
+
+        # 4. Validate each motif is a substructure and has enough atoms
+        from rdkit import Chem
+        for idx_str, motif_smiles in pred_motifs.items():
+            try:
+                mol_idx = int(idx_str)
+                if mol_idx < 0 or mol_idx >= len(molecules):
+                    errors.append(f"Invalid molecule index: {mol_idx}")
+                    continue
+
+                mol_smiles = molecules[mol_idx]
+                motif_mol = Chem.MolFromSmiles(motif_smiles)
+                parent_mol = Chem.MolFromSmiles(mol_smiles)
+
+                if motif_mol is None:
+                    errors.append(f"Invalid SMILES for motif at index {mol_idx}: {motif_smiles}")
+                    continue
+
+                if parent_mol is None:
+                    errors.append(f"Invalid SMILES for parent molecule at index {mol_idx}")
+                    continue
+
+                # Check substructure
+                if not parent_mol.HasSubstructMatch(motif_mol):
+                    errors.append(f"Motif at index {mol_idx} is not a substructure of the parent molecule")
+
+                # Check minimum atoms
+                num_atoms = motif_mol.GetNumHeavyAtoms()
+                if num_atoms < min_motif_atoms:
+                    errors.append(f"Motif at index {mol_idx} has {num_atoms} atoms, minimum is {min_motif_atoms}")
+
+            except Exception as e:
+                errors.append(f"Error validating motif at index {idx_str}: {e}")
+
+        # 5. Check constraint satisfaction (only if no validation errors so far)
+        if not errors:
+            try:
+                actual_total = 0
+                for motif_smiles in pred_motifs.values():
+                    motif_mol = Chem.MolFromSmiles(motif_smiles)
+                    if motif_mol is None:
+                        continue
+
+                    if constraint_type == "total_aromatic_rings":
+                        value = count_aromatic_rings(motif_mol)
+                    elif constraint_type and constraint_type.startswith("total_"):
+                        # Extract functional group name
+                        fg_key = constraint_type[6:]  # Remove "total_" prefix
+                        if fg_key.endswith("s"):
+                            fg_key = fg_key[:-1]  # Remove plural "s"
+                        fg_counts = count_functional_groups(motif_mol)
+                        value = fg_counts.get(fg_key, 0)
+                    else:
+                        fg_counts = count_functional_groups(motif_mol)
+                        value = fg_counts.get(constraint_type, 0)
+
+                    actual_total += value
+
+                constraint_satisfied = (actual_total == target_value)
+                if not constraint_satisfied:
+                    errors.append(f"Constraint not satisfied: {constraint_type}={actual_total}, expected {target_value}")
+
+            except Exception as e:
+                errors.append(f"Error checking constraint: {e}")
+
+        # Overall correct if constraint is satisfied and no errors
+        correct = constraint_satisfied and len(errors) == 0
+
+        return {
+            "pred_indices": pred_indices,
+            "pred_motifs": pred_motifs,
+            "gold_indices": gold_indices,  # Reference only
+            "gold_motifs": gold_motifs,    # Reference only
+            "correct": correct,
+            "constraint_satisfied": constraint_satisfied,
+            "actual_total": actual_total,
+            "expected_total": target_value,
+            "errors": errors if errors else None,
+        }
+
     return {"error": f"Unknown task: {task}", "correct": False}
 
 
@@ -739,8 +1060,8 @@ def main():
                     help="Environment variable name for API key (default: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY based on provider)")
     ap.add_argument("--base_url", type=str, default=None,
                     help="Base URL for API (default: provider-specific default)")
-    ap.add_argument("--max_tokens", type=int, default=5000)
-    ap.add_argument("--thinking_budget", type=int, default=5000,
+    ap.add_argument("--max_tokens", type=int, default=4096)
+    ap.add_argument("--thinking_budget", type=int, default=4096,
                     help="For Gemini 2.5: soft limit on thinking tokens")
     ap.add_argument("--thinking_level", type=str, choices=["low", "medium", "high"], default=None,
                     help="For Gemini 3.x: control reasoning depth (low/medium/high). Recommended for token control.")
@@ -783,7 +1104,11 @@ def main():
             max_tokens=args.max_tokens,
             temperature=args.temperature,
         )
-        call_func = call_openai_response
+        # Use chat completions for Azure, responses API for standard OpenAI
+        if "azure" in args.base_url.lower() or "hms.edu" in args.base_url.lower():
+            call_func = call_openai_chat
+        else:
+            call_func = call_openai_response
     elif args.provider == "claude":
         cfg = ClaudeChatConfig(
             model=args.model,
@@ -843,22 +1168,67 @@ def main():
         all_instances = selected_instances
         print(f"[TEST MODE] Processing {len(all_instances)} total instances (test_mode={args.test_mode})")
 
+    # Load existing results for resumption
+    processed_ids = set()
     rows = []
-    with out_path.open("w", encoding="utf-8") as f_out:
-        for inst in all_instances:
-            text = call_func(inst["prompt"], cfg)
-            score = score_instance(inst, text)
+    if out_path.exists():
+        print(f"[RESUME] Found existing results file: {out_path}")
+        with out_path.open("r", encoding="utf-8") as f_in:
+            for line in f_in:
+                try:
+                    row = json.loads(line)
+                    processed_ids.add(row["id"])
+                    rows.append(row)  # Keep existing results in memory for summary
+                except json.JSONDecodeError:
+                    print(f"[RESUME WARNING] Skipping invalid JSON line in existing results")
+                    continue
+        print(f"[RESUME] Loaded {len(processed_ids)} existing results")
 
-            row = {
-                "id": inst["id"],
-                "task": inst["task"],
-                "n_molecules": inst["n_molecules"],
-                "model": args.model,
-                "response_text": text,
-                "score": score,
-            }
-            rows.append(row)
-            f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # Filter to unprocessed instances
+    original_count = len(all_instances)
+    all_instances = [inst for inst in all_instances if inst["id"] not in processed_ids]
+    skipped_count = original_count - len(all_instances)
+
+    if skipped_count > 0:
+        print(f"[RESUME] Skipping {skipped_count} already-processed instances")
+    print(f"[PROGRESS] Processing {len(all_instances)} remaining instances")
+
+    if len(all_instances) == 0:
+        print(f"[RESUME] All instances already processed, nothing to do")
+    else:
+        # Open in append mode to preserve existing results
+        with out_path.open("a", encoding="utf-8") as f_out:
+            for idx, inst in enumerate(all_instances, 1):
+                # Handle both "prompt" (old format) and "question" (unified format)
+                prompt_text = inst.get("question") or inst.get("prompt")
+                if not prompt_text:
+                    raise ValueError(f"Instance {inst['id']} missing both 'question' and 'prompt' fields")
+
+                print(f"[PROGRESS] Processing instance {idx}/{len(all_instances)} (ID: {inst['id']}, Task: {inst['task']})")
+
+                text = call_func(prompt_text, cfg)
+                score = score_instance(inst, text)
+
+                # Get n_molecules from various possible locations
+                n_mols = inst.get("n_molecules")
+                if n_mols is None and "metadata" in inst:
+                    n_mols = inst["metadata"].get("n_molecules")
+                if n_mols is None and "answer" in inst and "molecules" in inst["answer"]:
+                    n_mols = len(inst["answer"]["molecules"])
+
+                row = {
+                    "id": inst["id"],
+                    "task": inst["task"],
+                    "n_molecules": n_mols,
+                    "model": args.model,
+                    "response_text": text,
+                    "score": score,
+                }
+                rows.append(row)
+                f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f_out.flush()  # Ensure data is written immediately
+
+                print(f"[PROGRESS] Completed instance {idx}/{len(all_instances)} - Correct: {score.get('correct', False)}")
 
     summary = summarize_scores(rows)
     summary_path = out_path.with_suffix(".summary.json")

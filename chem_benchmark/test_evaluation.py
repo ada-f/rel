@@ -158,10 +158,139 @@ def test_c3_examples():
             print(f"    Precision: {result.get('precision', 0):.3f}, Recall: {result.get('recall', 0):.3f}, F1: {result.get('f1', 0):.3f}")
 
 
+def test_c4_examples():
+    """Test REL-C4 (avoid certain scaffolds) evaluation with 3 examples."""
+    examples = [
+        {
+            "question": "Given three groups of molecules:\n\nGroup 1 (molecules containing phenol):\n1. Oc1ccccc1CCCCCC\n2. CCCCCCOc1ccccc1O\n\nGroup 2 (molecules containing benzoic acid):\n1. O=C(O)c1ccccc1CCCCCC\n2. CCCCCCC(=O)Oc1ccccc1C(=O)O\n\nGroup 3 (molecules containing both phenol and benzoic acid):\n1. Oc1ccccc1CCCCCCc1ccccc1C(=O)O\n2. CCCCCCOc1ccccc1OCCCCCCc1ccccc1C(=O)O\n\nFind the largest connected component that is shared by molecules in Group 3 but NOT present in molecules in Groups 1 or 2.\n\nReturn your final answer as a single SMILES wrapped exactly like:\n<smiles>YOUR_SMILES_HERE</smiles>\nNo explanation.",
+            "answer": {"smiles": "CCCCCC"},
+            "responses": [
+                "<smiles>CCCCCC</smiles>",  # Correct
+                "<smiles>c1ccccc1</smiles>",  # Incorrect (benzene, not the linker)
+                "<smiles>CC</smiles>",  # Incorrect (too small)
+            ]
+        },
+        {
+            "question": "Given three groups of molecules:\n\nGroup 1 (molecules containing aniline):\n1. Nc1ccccc1CCCCCCC\n2. CCCCCCCNc1ccccc1N\n\nGroup 2 (molecules containing nitrobenzene):\n1. O=[N+]([O-])c1ccccc1CCCCCCC\n2. CCCCCCC[N+](=O)[O-]c1ccccc1[N+](=O)[O-]\n\nGroup 3 (molecules containing both aniline and nitrobenzene):\n1. Nc1ccccc1CCCCCCCc1ccccc1[N+](=O)[O-]\n2. CCCCCCCNc1ccccc1NCCCCCCCc1ccccc1[N+](=O)[O-]\n\nFind the largest connected component that is shared by molecules in Group 3 but NOT present in molecules in Groups 1 or 2.\n\nReturn your final answer as a single SMILES wrapped exactly like:\n<smiles>YOUR_SMILES_HERE</smiles>\nNo explanation.",
+            "answer": {"smiles": "CCCCCCC"},
+            "responses": [
+                "<smiles>CCCCCCC</smiles>",  # Correct
+                "<smiles>CC</smiles>",  # Incorrect (too small)
+                "<smiles>c1ccccc1</smiles>",  # Incorrect (benzene, not the linker)
+            ]
+        },
+        {
+            "question": "Given three groups of molecules:\n\nGroup 1 (molecules containing pyridine):\n1. c1ccc(CCCCCCCC)nc1\n2. CCCCCCCCc1ccccn1\n\nGroup 2 (molecules containing pyrimidine):\n1. c1ccc(CCCCCCCC)ncn1\n2. CCCCCCCCc1ncccn1\n\nGroup 3 (molecules containing both pyridine and pyrimidine):\n1. c1ccc(CCCCCCCCc2ccccn2)nc1\n2. CCCCCCCCc1ccccn1CCCCCCCCc1ncccn1\n\nFind the largest connected component that is shared by molecules in Group 3 but NOT present in molecules in Groups 1 or 2.\n\nReturn your final answer as a single SMILES wrapped exactly like:\n<smiles>YOUR_SMILES_HERE</smiles>\nNo explanation.",
+            "answer": {"smiles": "CCCCCCCC"},
+            "responses": [
+                "<smiles>CCCCCCCC</smiles>",  # Correct
+                "<smiles>c1ccncc1</smiles>",  # Incorrect (pyridine, not the linker)
+                "<smiles>CCC</smiles>",  # Incorrect (too small)
+            ]
+        },
+    ]
+
+    print("\n" + "=" * 80)
+    print("Testing REL-C4 (Avoid Certain Scaffolds) Evaluation")
+    print("=" * 80)
+
+    for i, example in enumerate(examples, 1):
+        print(f"\nExample {i}:")
+        print(f"Question: {example['question'][:100]}...")
+        print(f"Gold Answer: {example['answer']['smiles']}")
+
+        for j, response in enumerate(example['responses'], 1):
+            result = evaluate_response(example['question'], example['answer'], response, task="REL-C4")
+            print(f"\n  Response {j}: {response[:50]}...")
+            print(f"    Predicted: {result.get('pred')}")
+            print(f"    Correct: {result.get('correct')}")
+            print(f"    Response is substructure of correct: {result.get('response_is_substructure_of_correct')}")
+            print(f"    Correct is substructure of response: {result.get('correct_is_substructure_of_response')}")
+            print(f"    Overlap metric: {result.get('overlap_metric', 0):.3f}")
+
+
+def test_c5_examples():
+    """Test REL-C5 (constraint satisfaction with motif selection) evaluation with 3 examples."""
+    examples = [
+        {
+            "question": "Given the following 5 molecules, select continuous motifs from exactly 3 molecules such that each motif has at least 6 atoms AND the total number of carboxylic acid groups across all selected motifs equals 2.\n\nMolecules:\n1. CC(C)c1ccc(C(C)C(=O)O)cc1\n2. O=C(O)Cc1ccccc1Cl\n3. CCCCCCc1ccccc1\n4. CC(C)Cc1ccc(O)cc1\n5. O=C(O)c1ccccc1C(=O)O\n\nReturn your answer in this exact format:\n<indices>comma-separated indices of selected molecules (0-indexed)</indices>\n<motif_i>SMILES of motif from molecule i</motif_i>\n\nNo explanation.",
+            "answer": {
+                "molecules": ["CC(C)c1ccc(C(C)C(=O)O)cc1", "O=C(O)Cc1ccccc1Cl", "CCCCCCc1ccccc1", "CC(C)Cc1ccc(O)cc1", "O=C(O)c1ccccc1C(=O)O"],
+                "selected_molecule_indices": [0, 1, 2],
+                "selected_motifs": {
+                    "0": "C(C)C(=O)O",
+                    "1": "O=C(O)Cc1ccccc1",
+                    "2": "CCCCCCc1ccccc1"
+                }
+            },
+            "responses": [
+                "<indices>0, 1, 2</indices>\n<motif_0>C(C)C(=O)O</motif_0>\n<motif_1>O=C(O)Cc1ccccc1</motif_1>\n<motif_2>CCCCCCc1ccccc1</motif_2>",  # Correct
+                "<indices>0, 1, 4</indices>\n<motif_0>C(C)C(=O)O</motif_0>\n<motif_1>O=C(O)Cc1ccccc1</motif_1>\n<motif_4>c1ccccc1</motif_4>",  # Incorrect indices
+                "<indices>0, 1, 2</indices>\n<motif_0>CC(C)C</motif_0>\n<motif_1>Cc1ccccc1</motif_1>\n<motif_2>CCCCCC</motif_2>",  # Incorrect motifs
+            ]
+        },
+        {
+            "question": "Given the following 5 molecules, select continuous motifs from exactly 3 molecules such that each motif has at least 6 atoms AND the total number of aromatic rings across all selected motifs equals 3.\n\nMolecules:\n1. c1ccc(CCc2ccccc2)cc1\n2. CCCCCCc1ccccc1\n3. CCCCCCCCCC\n4. c1ccc2c(c1)ccc1ccccc12\n5. CC(C)Cc1ccc(O)cc1\n\nReturn your answer in this exact format:\n<indices>comma-separated indices of selected molecules (0-indexed)</indices>\n<motif_i>SMILES of motif from molecule i</motif_i>\n\nNo explanation.",
+            "answer": {
+                "molecules": ["c1ccc(CCc2ccccc2)cc1", "CCCCCCc1ccccc1", "CCCCCCCCCC", "c1ccc2c(c1)ccc1ccccc12", "CC(C)Cc1ccc(O)cc1"],
+                "selected_molecule_indices": [0, 1, 4],
+                "selected_motifs": {
+                    "0": "c1ccc(CCc2ccccc2)cc1",
+                    "1": "CCCCCCc1ccccc1",
+                    "4": "CCCCCC"
+                }
+            },
+            "responses": [
+                "<indices>0, 1, 4</indices>\n<motif_0>c1ccc(CCc2ccccc2)cc1</motif_0>\n<motif_1>CCCCCCc1ccccc1</motif_1>\n<motif_4>CCCCCC</motif_4>",  # Correct
+                "<indices>0, 1, 3</indices>\n<motif_0>c1ccccc1</motif_0>\n<motif_1>c1ccccc1</motif_1>\n<motif_3>c1ccccc1</motif_3>",  # Incorrect (wrong indices)
+                "<indices>0, 1, 4</indices>\n<motif_0>CCc1ccccc1</motif_0>\n<motif_1>CCCCCC</motif_1>\n<motif_4>Cc1ccccc1</motif_4>",  # Incorrect (wrong motifs)
+            ]
+        },
+        {
+            "question": "Given the following 5 molecules, select continuous motifs from exactly 3 molecules such that each motif has at least 6 atoms AND the total number of primary amine groups across all selected motifs equals 2.\n\nMolecules:\n1. NCCc1ccccc1CCN\n2. CC(C)Cc1ccc(N)cc1\n3. CCCCCCc1ccccc1\n4. O=C(O)Cc1ccccc1Cl\n5. Nc1ccccc1CCCCCN\n\nReturn your answer in this exact format:\n<indices>comma-separated indices of selected molecules (0-indexed)</indices>\n<motif_i>SMILES of motif from molecule i</motif_i>\n\nNo explanation.",
+            "answer": {
+                "molecules": ["NCCc1ccccc1CCN", "CC(C)Cc1ccc(N)cc1", "CCCCCCc1ccccc1", "O=C(O)Cc1ccccc1Cl", "Nc1ccccc1CCCCCN"],
+                "selected_molecule_indices": [0, 1, 2],
+                "selected_motifs": {
+                    "0": "NCCc1ccccc1",
+                    "1": "Cc1ccc(N)cc1",
+                    "2": "CCCCCCc1ccccc1"
+                }
+            },
+            "responses": [
+                "<indices>0, 1, 2</indices>\n<motif_0>NCCc1ccccc1</motif_0>\n<motif_1>Cc1ccc(N)cc1</motif_1>\n<motif_2>CCCCCCc1ccccc1</motif_2>",  # Correct
+                "<indices>0, 4, 2</indices>\n<motif_0>NCCc1ccccc1</motif_0>\n<motif_4>Nc1ccccc1</motif_4>\n<motif_2>CCCCCCc1ccccc1</motif_2>",  # Incorrect (wrong indices)
+                "<indices>0, 1, 2</indices>\n<motif_0>c1ccccc1</motif_0>\n<motif_1>CCCCCC</motif_1>\n<motif_2>c1ccccc1</motif_2>",  # Incorrect (wrong motifs, no amines)
+            ]
+        },
+    ]
+
+    print("\n" + "=" * 80)
+    print("Testing REL-C5 (Constraint Satisfaction with Motif Selection) Evaluation")
+    print("=" * 80)
+
+    for i, example in enumerate(examples, 1):
+        print(f"\nExample {i}:")
+        print(f"Question: {example['question'][:100]}...")
+        print(f"Gold indices: {example['answer']['selected_molecule_indices']}")
+        print(f"Gold motifs: {list(example['answer']['selected_motifs'].values())}")
+
+        for j, response in enumerate(example['responses'], 1):
+            result = evaluate_response(example['question'], example['answer'], response, task="REL-C5")
+            print(f"\n  Response {j}:")
+            print(f"    Predicted indices: {result.get('pred_indices')}")
+            print(f"    Predicted motifs: {result.get('pred_motifs')}")
+            print(f"    Indices correct: {result.get('indices_correct')}")
+            print(f"    Motifs correct: {result.get('motifs_correct')}")
+            print(f"    Overall correct: {result.get('correct')}")
+
+
 if __name__ == "__main__":
     test_c1_examples()
     test_c2_examples()
     test_c3_examples()
+    test_c4_examples()
+    test_c5_examples()
     print("\n" + "=" * 80)
     print("All chemistry evaluation tests completed!")
     print("=" * 80)
