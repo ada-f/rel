@@ -468,8 +468,8 @@ def main():
         "q1a_largest_common_motif_chembl": "REL-C2",
         "q1b_largest_common_motif_scaffold": "REL-C2",
         "q3_missing_isomers": "REL-C3",
-        "q4_avoid_scaffolds": "REL-C4",
-        "q5_constraint_satisfaction_selection": "REL-C5",
+        "q5_constraint_satisfaction_selection": "REL-C4",
+        "q4_avoid_scaffolds": "REL-C5",
     }
 
     def convert_to_unified_format(inst):
