@@ -252,7 +252,8 @@ def evaluate_c4_response(question: str, answer: Dict[str, Any], response: str, m
     Evaluate response for REL-C4 (avoid certain scaffolds).
 
     Similar to REL-C2, uses isomorphic matching to verify the response SMILES
-    represents the same molecule as the correct answer.
+    represents the same molecule as the correct answer. Expected response format:
+    <smiles>...</smiles>
 
     Enhanced with edge case detection:
     - Validates SMILES parseability
