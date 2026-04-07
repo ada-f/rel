@@ -7,6 +7,9 @@
   <a href="https://huggingface.co/datasets/YOUR_DATASET_PATH">
     <img src="https://img.shields.io/badge/Dataset-Hugging%20Face-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face">
   </a>
+  <a href="https://zitniklab.hms.harvard.edu/REL/">
+    <img src="https://img.shields.io/badge/Project-Website-0A7A5A?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Project Website">
+  </a>
 </p>
 
 <p align="center">
@@ -26,7 +29,7 @@
 
 ## Setup
 
-This repo is configured around `uv` and the local helper script in [setup_uv_env.sh](/n/holylabs/LABS/mzitnik_lab/Users/afang/relational_reasoning/setup_uv_env.sh).
+This repo is configured around `uv` and the local helper script in [setup_uv_env.sh](setup_uv_env.sh).
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -34,11 +37,12 @@ source setup_uv_env.sh
 source "$UV_PROJECT_ENVIRONMENT/bin/activate"
 ```
 
-If you want the full environment notes, including cache locations and troubleshooting, see [UV_SETUP.md](/n/holylabs/LABS/mzitnik_lab/Users/afang/relational_reasoning/UV_SETUP.md).
+If you want the full environment notes, including cache locations and troubleshooting, see [UV_SETUP.md](UV_SETUP.md).
 
-## Questions
+## Running the benchmark
 
-Run the questions provided in `REL/` with your model or download them from Hugging Face with `hf download ada-f/rel --repo-type dataset --local-dir .`.
+The questions are provided in `REL/` or you can download them from Hugging Face with `hf download ada-f/rel --repo-type dataset --local-dir .`.
+Run your LLM on the questions and evaluate the responses with the domain evaluators. Examples of how to run fronteir LLMs (Claude, Gemini, GPT-5) are provided in `chem_benchmark/llm_runner.py`.
 
 ### Evaluate responses from your own pipeline
 
@@ -48,13 +52,13 @@ If you already have model responses and just want scoring, use the domain evalua
 - Biology: `bio_benchmark.evaluation`
 - Algebra: `algebra_benchmark.evaluation`
 
-The expected answer formats and minimal examples are in [docs/EVALUATION.md](/n/holylabs/LABS/mzitnik_lab/Users/afang/relational_reasoning/docs/EVALUATION.md).
+The expected answer formats and minimal examples are in [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ## More Docs
 
-- [docs/EVALUATION.md](/n/holylabs/LABS/mzitnik_lab/Users/afang/relational_reasoning/docs/EVALUATION.md): scoring details and example commands
-- [docs/DEVELOPMENT.md](/n/holylabs/LABS/mzitnik_lab/Users/afang/relational_reasoning/docs/DEVELOPMENT.md): tests, dataset generation, and validation workflows
-- [docs/DATASETS.md](/n/holylabs/LABS/mzitnik_lab/Users/afang/relational_reasoning/docs/DATASETS.md): unified dataset format and task layout
+- [docs/EVALUATION.md](docs/EVALUATION.md): scoring details and example commands
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): tests, dataset generation, and validation workflows
+- [docs/DATASETS.md](docs/DATASETS.md): unified dataset format and task layout
 
 ## Citation
 
