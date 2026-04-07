@@ -17,7 +17,7 @@ class MCSResult:
     smarts_pattern: Optional[str] = None
 
 
-def solve_q1_largest_common_motif(
+def solve_q2_largest_common_motif(
     smiles_list: Sequence[str],
     *,
     timeout_s: int = 15,
@@ -87,7 +87,7 @@ def solve_q1_largest_common_motif(
     )
 
 
-def solve_q2_is_constitutional_isomer_set(smiles_list: Sequence[str]) -> Optional[str]:
+def solve_q1_is_constitutional_isomer_set(smiles_list: Sequence[str]) -> Optional[str]:
     """
     Q2: Return 'Yes' if:
       - all molecules parse

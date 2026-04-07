@@ -57,7 +57,7 @@ The expected answer formats and minimal examples are in [docs/EVALUATION.md](doc
 ## More Docs
 
 - [docs/EVALUATION.md](docs/EVALUATION.md): scoring details and example commands
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): tests, dataset generation, and validation workflows
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): tests and how to generate new benchmark questions
 - [docs/DATASETS.md](docs/DATASETS.md): unified dataset format and task layout
 
 ## Citation

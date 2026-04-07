@@ -8,7 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import rdFMCS
 
 from .molecule_bank import BankIndex, MoleculeRecord
-from .solvers import solve_q1_largest_common_motif, solve_q2_is_constitutional_isomer_set, solve_q3_missing_isomers
+from .solvers import solve_q2_largest_common_motif, solve_q1_is_constitutional_isomer_set, solve_q3_missing_isomers
 from .rdkit_utils import canonical_smiles, canonical_smiles_from_smiles, mol_from_smiles, mol_formula
 
 
@@ -51,8 +51,7 @@ def verify_motif_in_all_molecules(motif_smiles: str, molecules: Sequence[str]) -
     return True
 
 
-def build_q1_prompt(smiles: Sequence[str]) -> str:
-    # Mirrors your Q1 description: "largest continuous common chemical motif" and answer as <smiles>.
+def build_q2_prompt(smiles: Sequence[str]) -> str:
     return (
         "Given the following list of SMILES, what is the largest *connected* common chemical motif "
         "(maximum common substructure) present in every molecule?\n"
@@ -68,7 +67,7 @@ def build_q1_prompt(smiles: Sequence[str]) -> str:
     )
 
 
-def build_q2_prompt(smiles: Sequence[str]) -> str:
+def build_q1_prompt(smiles: Sequence[str]) -> str:
     return (
         "Is this list of molecules a set of *constitutional isomers* (same molecular formula, different connectivity)?\n\n"
         "SMILES:\n"
@@ -92,7 +91,7 @@ def build_q3_prompt(given: Sequence[str]) -> str:
     )
 
 
-def generate_q1a_instance(
+def generate_q2_instance(
     *,
     instance_id: str,
     bank_index: BankIndex,
@@ -103,7 +102,7 @@ def generate_q1a_instance(
     mcs_timeout_s: int = 15,
 ) -> BenchmarkInstance:
     """
-    Q1a: Similarity-based sampling from ChEMBL molecules.
+    Q2: Similarity-based sampling from ChEMBL molecules.
     Uses Tanimoto similarity (0.35-0.90) to find related molecules.
 
     Suitable for smaller n (5-20) where diverse molecules can still share meaningful motifs.
@@ -124,7 +123,7 @@ def generate_q1a_instance(
 
     for attempt in range(adaptive_max_attempts):
         group = bank_index.sample_similar_group(n_molecules, rng=rng, force_scaffold_sampling=False)
-        mcs = solve_q1_largest_common_motif(group, timeout_s=adaptive_timeout)
+        mcs = solve_q2_largest_common_motif(group, timeout_s=adaptive_timeout)
         if mcs is None:
             continue
         if mcs.num_atoms < adaptive_min_atoms:
@@ -143,10 +142,10 @@ def generate_q1a_instance(
         if num_atoms < adaptive_min_atoms:
             continue
 
-        prompt = build_q1_prompt(group)
+        prompt = build_q2_prompt(group)
         return BenchmarkInstance(
             id=instance_id,
-            task="q1a_largest_common_motif_chembl",
+            task="q2_largest_common_motif_chembl",
             n_molecules=n_molecules,
             molecules=list(group),
             prompt=prompt,
@@ -160,88 +159,10 @@ def generate_q1a_instance(
                 "corrected": corrected,
             },
         )
-    raise RuntimeError(f"Failed to generate a valid Q1a instance after {adaptive_max_attempts} attempts (min_mcs_atoms={adaptive_min_atoms})")
+    raise RuntimeError(f"Failed to generate a valid Q2 instance after {adaptive_max_attempts} attempts (min_mcs_atoms={adaptive_min_atoms})")
 
 
-def generate_q1b_instance(
-    *,
-    instance_id: str,
-    bank_index: BankIndex,
-    n_molecules: int,
-    rng,
-    min_mcs_atoms: int = 6,
-    max_attempts: int = 200,
-    mcs_timeout_s: int = 15,
-) -> BenchmarkInstance:
-    """
-    Q1b: Scaffold-based sampling from ChEMBL molecules.
-    Samples molecules sharing a common Murcko scaffold.
-
-    Suitable for larger n (20-50) where scaffold ensures meaningful shared core.
-    Default min_mcs_atoms=6 because scaffolds typically give 5-10 atom cores.
-    """
-    # Adjust parameters for larger molecule sets
-    if n_molecules <= 20:
-        adaptive_timeout = max(30, n_molecules * 2)
-    else:
-        adaptive_timeout = max(60, n_molecules * 3)
-
-    # Scale min_mcs_atoms: scaffold core size varies by family
-    if n_molecules <= 20:
-        adaptive_min_atoms = min_mcs_atoms  # Expect 6+ atoms
-    elif n_molecules <= 35:
-        adaptive_min_atoms = max(5, min_mcs_atoms - 1)
-    else:  # n > 35
-        adaptive_min_atoms = 5  # Large families may have smaller cores
-
-    # More attempts for larger n
-    if n_molecules <= 20:
-        adaptive_max_attempts = max_attempts
-    else:
-        adaptive_max_attempts = max_attempts * 2
-
-    for attempt in range(adaptive_max_attempts):
-        group = bank_index.sample_similar_group(n_molecules, rng=rng, force_scaffold_sampling=True)
-        mcs = solve_q1_largest_common_motif(group, timeout_s=adaptive_timeout)
-        if mcs is None:
-            continue
-        if mcs.num_atoms < adaptive_min_atoms:
-            continue
-
-        # Verify that the motif is actually present in all molecules
-        motif_smiles = mcs.motif_smiles
-        num_atoms = mcs.num_atoms
-        num_bonds = mcs.num_bonds
-        corrected = False
-
-        if not verify_motif_in_all_molecules(motif_smiles, group):
-            continue
-
-        # Check if (possibly corrected) motif still meets minimum size
-        if num_atoms < adaptive_min_atoms:
-            continue
-
-        prompt = build_q1_prompt(group)
-        return BenchmarkInstance(
-            id=instance_id,
-            task="q1b_largest_common_motif_scaffold",
-            n_molecules=n_molecules,
-            molecules=list(group),
-            prompt=prompt,
-            answer={"smiles": motif_smiles},
-            metadata={
-                "mcs_num_atoms": num_atoms,
-                "mcs_num_bonds": num_bonds,
-                "attempt": attempt,
-                "sampling_strategy": "scaffold",
-                "adaptive_min_atoms": adaptive_min_atoms,
-                "corrected": corrected,
-            },
-        )
-    raise RuntimeError(f"Failed to generate a valid Q1b instance after {adaptive_max_attempts} attempts (min_mcs_atoms={adaptive_min_atoms})")
-
-
-def generate_q2_instance(
+def generate_q1_instance(
     *,
     instance_id: str,
     universe_by_formula: Dict[str, List[str]],
@@ -250,7 +171,7 @@ def generate_q2_instance(
     want_yes: bool = True,
 ) -> BenchmarkInstance:
     """
-    Generates a Q2 instance. For 'Yes': sample N from one formula universe.
+    Generates a Q1 instance. For 'Yes': sample N from one formula universe.
     For 'No': sample N-1 from one formula universe and 1 from a different formula universe.
     """
     formulas = [f for f, u in universe_by_formula.items() if len(u) >= n_molecules]
@@ -261,15 +182,15 @@ def generate_q2_instance(
         f = formulas[rng.randrange(len(formulas))]
         u = universe_by_formula[f]
         chosen = rng.sample(u, n_molecules)
-        label = solve_q2_is_constitutional_isomer_set(chosen)
-        assert label == "Yes", f"Failed to solve Q2 instance {instance_id} for formula {f}"
+        label = solve_q1_is_constitutional_isomer_set(chosen)
+        assert label == "Yes", f"Failed to solve Q1 instance {instance_id} for formula {f}"
         # Should be Yes; if not, fallback to strict label from solver
         if label is None:
             label = "No"
-        prompt = build_q2_prompt(chosen)
+        prompt = build_q1_prompt(chosen)
         return BenchmarkInstance(
             id=instance_id,
-            task="q2_isomer_set_yes_no",
+            task="q1_isomer_set_yes_no",
             n_molecules=n_molecules,
             molecules=chosen,
             prompt=prompt,
@@ -312,13 +233,13 @@ def generate_q2_instance(
 
     # Verify no duplicates
     if len(set(chosen)) != len(chosen):
-        raise ValueError(f"Generated Q2 'No' instance has duplicate SMILES: {chosen}")
+        raise ValueError(f"Generated Q1 'No' instance has duplicate SMILES: {chosen}")
 
-    label = solve_q2_is_constitutional_isomer_set(chosen) or "No"
-    prompt = build_q2_prompt(chosen)
+    label = solve_q1_is_constitutional_isomer_set(chosen) or "No"
+    prompt = build_q1_prompt(chosen)
     return BenchmarkInstance(
         id=instance_id,
-        task="q2_isomer_set_yes_no",
+        task="q1_isomer_set_yes_no",
         n_molecules=n_molecules,
         molecules=chosen,
         prompt=prompt,
@@ -373,12 +294,12 @@ def generate_q3_instance(
     )
 
 
-def build_q4_prompt(
+def build_q5_prompt(
     group_combined: List[str],
     scaffold_smiles: List[str],
 ) -> str:
     """
-    Build prompt for Q4 - identify linker fragment that connects scaffolds.
+    Build prompt for Q5 - identify linker fragment that connects scaffolds.
 
 
     Args:
@@ -386,7 +307,7 @@ def build_q4_prompt(
         scaffold_smiles: List of scaffold SMILES to exclude from answer
 
     Returns:
-        Formatted prompt string for Q4 task
+        Formatted prompt string for Q5 task
     """
     combined_list = _format_smiles_list(group_combined)
     scaffold_list = _format_smiles_list(scaffold_smiles)
@@ -426,7 +347,7 @@ def build_q4_prompt(
     )
 
 
-def generate_q4_instance(
+def generate_q5_instance(
     *,
     instance_id: str,
     scaffolds: List[Dict[str, str]],
@@ -438,7 +359,7 @@ def generate_q4_instance(
     max_attempts: int = 50,
 ) -> Optional[BenchmarkInstance]:
     """
-    Q4: Scaffold avoidance - generalized for N scaffolds.
+    Q5: Scaffold avoidance - generalized for N scaffolds.
 
     Creates N+1 groups:
     - Group i (i=1..N): scaffold_i + linker + decoration
@@ -452,7 +373,7 @@ def generate_q4_instance(
 
     N = len(scaffolds)
     if N < 2:
-        raise ValueError("Need at least 2 scaffolds for Q4")
+        raise ValueError("Need at least 2 scaffolds for Q5")
 
     # Extract scaffold SMILES and names
     scaffold_smiles = [s["scaffold"] for s in scaffolds]
@@ -523,7 +444,7 @@ def generate_q4_instance(
 
     # Build the instance
     # Use simplified prompt (achieves 80% accuracy vs 0% with old complex prompt)
-    prompt = build_q4_prompt(group_combined, scaffold_smiles)
+    prompt = build_q5_prompt(group_combined, scaffold_smiles)
 
     all_molecules = [mol for group in groups for mol in group] + group_combined
 
@@ -546,7 +467,7 @@ def generate_q4_instance(
 
     return BenchmarkInstance(
         id=instance_id,
-        task="q4_avoid_scaffolds",
+        task="q5_avoid_scaffolds",
         n_molecules=len(all_molecules),
         molecules=all_molecules,
         prompt=prompt,
@@ -555,14 +476,14 @@ def generate_q4_instance(
     )
 
 
-def build_q5_prompt(
+def build_q4_prompt(
     molecules: List[str],
     constraint_type: str,
     target_value: int,
     k_molecules: int,
     min_motif_atoms: int,
 ) -> str:
-    """Build prompt for Q5 (constraint satisfaction with selection)."""
+    """Build prompt for Q4 (constraint satisfaction with selection)."""
     constraint_name_map = {
         "aromatic_ring": "aromatic rings (e.g., benzene c1ccccc1, pyridine)",
         "carboxylic_acid": "carboxylic acid groups (-COOH, written as C(=O)O in SMILES)",
@@ -639,7 +560,7 @@ def build_q5_prompt(
     )
 
 
-def generate_q5_instance(
+def generate_q4_instance(
     *,
     instance_id: str,
     bank_index: BankIndex,
@@ -652,7 +573,7 @@ def generate_q5_instance(
     max_attempts: int = 100,
 ) -> Optional[BenchmarkInstance]:
     """
-    Q5: Constraint satisfaction - select motifs from ALL molecules satisfying constraint.
+    Q4: Constraint satisfaction - select motifs from ALL molecules satisfying constraint.
 
     NEW DESIGN:
     - Selects a motif from EVERY molecule (k_molecules = n_molecules)
@@ -672,7 +593,7 @@ def generate_q5_instance(
     k_molecules = n_molecules
 
     for attempt in range(max_attempts):
-        logger.info(f"Q5 generation attempt {attempt + 1}/{max_attempts}")
+        logger.info(f"Q4 generation attempt {attempt + 1}/{max_attempts}")
 
         # Sample molecules using similarity-based sampling
         try:
@@ -711,7 +632,7 @@ def generate_q5_instance(
         logger.info(f"Motif enumeration complete. Solving constraint satisfaction...")
 
         # Use DP-based solver to find achievable targets and select best one
-        solution = _solve_q5_with_dp(
+        solution = _solve_q4_with_dp(
             molecules_with_motifs,
             constraint_type,
             target_value,
@@ -724,7 +645,7 @@ def generate_q5_instance(
             actual_target = solution["target_value"]
             logger.info(f"Solution found! Target={actual_target}, Total={solution['total']}")
 
-            prompt = build_q5_prompt(
+            prompt = build_q4_prompt(
                 molecules,
                 constraint_type,
                 actual_target,
@@ -734,7 +655,7 @@ def generate_q5_instance(
 
             return BenchmarkInstance(
                 id=instance_id,
-                task="q5_constraint_satisfaction_selection",
+                task="q4_constraint_satisfaction_selection",
                 n_molecules=n_molecules,
                 molecules=list(molecules),
                 prompt=prompt,
@@ -756,11 +677,11 @@ def generate_q5_instance(
             logger.debug(f"No solution found on attempt {attempt + 1}")
 
     # Failed to find solvable instance
-    logger.warning(f"Failed to generate Q5 instance after {max_attempts} attempts")
+    logger.warning(f"Failed to generate Q4 instance after {max_attempts} attempts")
     return None
 
 
-def _solve_q5_with_dp(
+def _solve_q4_with_dp(
     molecules_with_motifs: List[Tuple[str, List[Dict]]],
     constraint_type: str,
     target_value: Optional[int],
@@ -768,7 +689,7 @@ def _solve_q5_with_dp(
     rng,
 ) -> Optional[Dict]:
     """
-    DP-based solver for Q5 constraint satisfaction.
+    DP-based solver for Q4 constraint satisfaction.
 
     NEW APPROACH:
     1. Compute all achievable target sums using DP
@@ -886,14 +807,14 @@ def _solve_q5_with_dp(
     }
 
 
-def _solve_q5_backtracking(
+def _solve_q4_backtracking(
     molecules_with_motifs: List[Tuple[str, List[Dict]]],
     constraint_type: str,
     target_value: int,
     k_molecules: int,
 ) -> Optional[Dict]:
     """
-    Backtracking solver for Q5 constraint satisfaction.
+    Backtracking solver for Q4 constraint satisfaction.
 
     Returns dict with:
     - selected_molecule_indices: List[int]
