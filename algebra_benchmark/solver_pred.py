@@ -18,7 +18,10 @@ def text2num(
 ) -> list[int]:
     """
     Extract answer index (0-7) from model output text.
-    Expects a single number 1-8 (1-based) or 0-7 (0-based); returns 0-based index.
+    Prefer ``Answer N`` / ``Answer #N`` with N in 0–7 (label matches index).
+    ``Answer 8`` is accepted as legacy (old eighth 1-based label → index 7).
+    For a bare digit, prefers 0-7 (0-based index) first, then 1-8 (1-based label) for backward
+    compatibility (e.g. ``8`` → index 7).
     n_attr and n_return are kept for compatibility with parent API; we return
     a list of length n_return (repeating the parsed index if n_return > 1).
     """
@@ -30,18 +33,23 @@ def text2num(
     m = re.search(r"Answer\s*#?\s*(\d+)", text, re.IGNORECASE)
     if m:
         num = int(m.group(1))
-        idx = (num - 1) if num >= 1 and num <= 8 else 0
+        if 0 <= num <= 7:
+            idx = num
+        elif num == 8:
+            idx = 7  # legacy: old prompts used Answer 1..8
+        else:
+            idx = 0
         idx = max(0, min(7, idx))
         return [idx] * max(1, n_return)
-    # Single number on its own line or at end
+    # Bare digit: prefer 0-based index (0-7), then 1-based option label (1-8)
+    m = re.search(r"\b([0-7])\b", text)
+    if m:
+        idx = int(m.group(1))
+        return [idx] * max(1, n_return)
     m = re.search(r"\b([1-8])\b", text)
     if m:
         num = int(m.group(1))
         idx = num - 1
-        return [idx] * max(1, n_return)
-    m = re.search(r"\b([0-7])\b", text)
-    if m:
-        idx = int(m.group(1))
         return [idx] * max(1, n_return)
     return [0] * max(1, n_return)
 

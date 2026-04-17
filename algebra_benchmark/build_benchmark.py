@@ -13,11 +13,15 @@ from typing import List, Any
 from algebra_benchmark.generators import generate_dataset
 from algebra_benchmark.rpm_numeric import build_query
 
+QUESTION_PREFIX = (
+    "Complete the Raven's progressive matrix. Only return the missing panel index (0-7)!\n"
+)
+
 
 def convert_to_unified_format(sample: dict, task: str, index: int) -> dict:
     """Convert an algebra sample to unified JSONL format."""
     # Build question text using the same method as the benchmark
-    prefix = "Complete the Raven's progressive matrix. Only return the missing panel index (1-8)!\n"
+    prefix = QUESTION_PREFIX
     question_text = build_query(sample, prefix=prefix)
     
     unified = {

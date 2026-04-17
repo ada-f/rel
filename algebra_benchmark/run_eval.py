@@ -16,8 +16,8 @@ from solver_pred import guard_answer, majority_vote, text2num
 
 
 def _stub_model(prompt: str, query: str) -> str:
-    """Stub model: returns 'Answer 1' for every query (for testing pipeline)."""
-    return "Answer 1"
+    """Stub model: returns 'Answer 0' for every query (for testing pipeline)."""
+    return "Answer 0"
 
 
 def run_eval(
@@ -25,13 +25,15 @@ def run_eval(
     model_fn: Callable[[str, str], str] | None = None,
     *,
     prompt: str = "Complete the Raven's progressive matrix:",
-    prefix: str = "Only return the missing panel index (1-8)!\n",
+    prefix: str = (
+        "Complete the Raven's progressive matrix. Only return the missing panel index (0-7)!\n"
+    ),
     n_return: int = 1,
 ) -> dict[str, Any]:
     """
     Load config and dataset, run model on each sample, compute accuracy.
 
-    model_fn(prompt, query) -> response string. If None, uses stub that returns "Answer 1".
+    model_fn(prompt, query) -> response string. If None, uses stub that returns "Answer 0".
     Returns dict with keys: correct, total, accuracy, predictions (list of pred indices).
     """
     cfg, samples = load_config_and_dataset(config_path)
@@ -69,8 +71,16 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Run evaluation on algebra_benchmark dataset.")
     p.add_argument("config", type=str, help="Path to config.yml (or config.json).")
     p.add_argument("--prompt", type=str, default="Complete the Raven's progressive matrix:", help="System/main prompt.")
-    p.add_argument("--prefix", type=str, default="Only return the missing panel index (1-8)!\n", help="Query prefix.")
-    p.add_argument("--stub", action="store_true", help="Use stub model (returns Answer 1) for testing.")
+    p.add_argument(
+        "--prefix",
+        type=str,
+        default=(
+            "Complete the Raven's progressive matrix. "
+            "Only return the missing panel index (0-7)!\n"
+        ),
+        help="Query prefix.",
+    )
+    p.add_argument("--stub", action="store_true", help="Use stub model (returns Answer 0) for testing.")
     args = p.parse_args()
 
     model_fn = _stub_model if args.stub else None
