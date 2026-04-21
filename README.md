@@ -1,7 +1,7 @@
-# REL: Relational Reasoning Benchmarks
+# Evaluating Relational Reasoning in LLMs with REL
 
 <p align="center">
-  <a href="https://arxiv.org/abs/YOUR_ARXIV_ID">
+  <a href="https://arxiv.org/abs/2604.12176">
     <img src="https://img.shields.io/badge/Paper-arXiv-B31B1B?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv">
   </a>
   <a href="https://huggingface.co/datasets/YOUR_DATASET_PATH">
@@ -64,9 +64,12 @@ The expected answer formats and minimal examples are in [docs/EVALUATION.md](doc
 
 ```bibtex
 @article{fesser2026rel,
-  title={Exploring Relational Reasoning Capabilities in LLMs with REL},
-  author={Fesser, Lukas and Ektefaie, Yasha and Fang, Ada and Zitnik, Marinka},
-  journal={},
-  year={2026}
+  title         = {Evaluating Relational Reasoning in LLMs with REL},
+  author        = {Lukas Fesser and Yasha Ektefaie and Ada Fang and Sham M. Kakade and Marinka Zitnik},
+  year          = {2026},
+  journal       = {arXiv preprint arXiv:2604.12176},
+  eprint        = {2604.12176},
+  archivePrefix = {arXiv},
+  url           = {https://arxiv.org/abs/2604.12176}
 }
 ```
